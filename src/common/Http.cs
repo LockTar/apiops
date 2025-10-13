@@ -18,15 +18,6 @@ using System.Threading.Tasks;
 
 namespace common;
 
-public sealed record BatchRequest
-{
-    public required Uri Uri { get; init; }
-    public required Guid Name { get; init; }
-    public required HttpMethod Method { get; init; }
-    public Option<IDictionary<string, string>> Headers { get; init; } = Option.None;
-    public Option<JsonNode> Content { get; init; } = Option.None;
-}
-
 public static class HttpPipelineModule
 {
     public static async ValueTask<Result<Option<ResponseHeaders>>> Head(this HttpPipeline pipeline, Uri uri, CancellationToken cancellationToken)
@@ -127,11 +118,6 @@ public static class HttpPipelineModule
             }
         });
     }
-
-    //public static async ValueTask BatchSend(this HttpPipeline pipeline, IEnumerable<BatchRequest> requests, CancellationToken cancellationToken)
-    //{
-
-    //}
 
     public static async ValueTask<Result<Unit>> PostJson(this HttpPipeline pipeline, Uri uri, JsonNode content, CancellationToken cancellationToken)
     {
@@ -292,41 +278,34 @@ public sealed class LoggingPolicy(ILogger logger) : HttpPipelinePolicy
 
     public override async ValueTask ProcessAsync(HttpMessage message, ReadOnlyMemory<HttpPipelinePolicy> pipeline)
     {
-        if (logger.IsEnabled(LogLevel.Trace))
-        {
-            logger.LogTrace("""
-                            Starting request
-                            Method: {HttpMethod}
-                            Uri: {Uri}
-                            Content: {RequestContent}
-                            """, message.Request.Method, message.Request.Uri, await GetRequestContent(message, message.CancellationToken));
-        }
-        else if (logger.IsEnabled(LogLevel.Debug))
-        {
-            logger.LogDebug("""
-                            Starting request
-                            Method: {HttpMethod}
-                            Uri: {Uri}
-                            """, message.Request.Method, message.Request.Uri);
-        }
+        var requestContent = await GetRequestContent(message, logger, message.CancellationToken);
+        logger.LogDebug("""
+                        Starting request
+                        Method: {HttpMethod}
+                        Uri: {Uri}
+                        Content: {RequestContent}
+                        """, message.Request.Method, message.Request.Uri, requestContent);
 
         var startTime = Stopwatch.GetTimestamp();
         await ProcessNextAsync(message, pipeline);
         var endTime = Stopwatch.GetTimestamp();
         var duration = TimeSpan.FromSeconds((endTime - startTime) / (double)Stopwatch.Frequency);
 
-        if (logger.IsEnabled(LogLevel.Trace))
+        var responseContent = GetResponseContent(message, logger);
+        if (message.Response.IsError && message.Response.Status is not 429 && message.Response.Status is not 404)
         {
-            logger.LogTrace("""
-                            Received response
-                            Method: {HttpMethod}
-                            Uri: {Uri}
-                            Status code: {StatusCode}
-                            Duration (hh:mm:ss): {Duration}
-                            Content: {ResponseContent}
-                            """, message.Request.Method, message.Request.Uri, message.Response.Status, duration.ToString("c"), GetResponseContent(message));
+            logger.LogWarning("""                
+                              Request failed.
+                              Method: {HttpMethod}
+                              Uri: {Uri}
+                              RequestContent: {RequestContent}
+                              Received response
+                              Status code: {StatusCode}
+                              Duration (hh:mm:ss): {Duration}
+                              ResponseContent: {ResponseContent}
+                              """, message.Request.Method, message.Request.Uri, requestContent, message.Response.Status, duration.ToString("c"), responseContent);
         }
-        else if (logger.IsEnabled(LogLevel.Debug))
+        else
         {
             logger.LogDebug("""
                             Received response
@@ -334,17 +313,26 @@ public sealed class LoggingPolicy(ILogger logger) : HttpPipelinePolicy
                             Uri: {Uri}
                             Status code: {StatusCode}
                             Duration (hh:mm:ss): {Duration}
-                            """, message.Request.Method, message.Request.Uri, message.Response.Status, duration.ToString("c"));
+                            Content: {ResponseContent}
+                            """, message.Request.Method, message.Request.Uri, message.Response.Status, duration.ToString("c"), responseContent);
         }
     }
 
-    private static async ValueTask<string> GetRequestContent(HttpMessage message, CancellationToken cancellationToken)
+    private static async ValueTask<string> GetRequestContent(HttpMessage message, ILogger logger, CancellationToken cancellationToken)
     {
         if (message.Request.Content is null)
         {
             return "<null>";
         }
-        else if (HeaderIsJson(message.Request.Headers))
+        else if (HeaderIsJson(message.Request.Headers) is false)
+        {
+            return "<non-json>";
+        }
+        else if (logger.IsEnabled(LogLevel.Trace) is false)
+        {
+            return "<suppressed>";
+        }
+        else
         {
             using var stream = new MemoryStream();
             await message.Request.Content.WriteToAsync(stream, cancellationToken);
@@ -353,22 +341,31 @@ public sealed class LoggingPolicy(ILogger logger) : HttpPipelinePolicy
 
             return data.ToString();
         }
-        else
-        {
-            return "<non-json>";
-        }
     }
 
     private static bool HeaderIsJson(IEnumerable<HttpHeader> headers) =>
         headers.Any(header => header.Name.Equals("Content-Type", StringComparison.OrdinalIgnoreCase)
                                 && header.Value.Contains("application/json", StringComparison.OrdinalIgnoreCase));
 
-    private static string GetResponseContent(HttpMessage message) =>
-        message.Response.Content is null
-        ? "<null>"
-        : HeaderIsJson(message.Response.Headers)
-            ? message.Response.Content.ToString()
-            : "<non-json>";
+    private static string GetResponseContent(HttpMessage message, ILogger logger)
+    {
+        if (message.Response.Content is null)
+        {
+            return "<null>";
+        }
+        else if (HeaderIsJson(message.Response.Headers) is false)
+        {
+            return "<non-json>";
+        }
+        else if (logger.IsEnabled(LogLevel.Trace) is false)
+        {
+            return "<suppressed>";
+        }
+        else
+        {
+            return message.Response.Content.ToString();
+        }
+    }
 }
 
 public class TelemetryPolicy(Version version) : HttpPipelinePolicy

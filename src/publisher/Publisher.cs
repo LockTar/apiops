@@ -3,10 +3,9 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System;
-using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Diagnostics;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -18,24 +17,34 @@ internal static class PublisherModule
 {
     public static void ConfigureRunPublisher(IHostApplicationBuilder builder)
     {
-        ResourceModule.ConfigureListResourcesToPut(builder);
-        ResourceModule.ConfigureListResourcesToDelete(builder);
+        GitModule.ConfigureCommitIdWasPassed(builder);
+        GitModule.ConfigureGetCurrentCommitFileOperations(builder);
+        GitModule.ConfigureGetPreviousCommitFileOperations(builder);
+        FileSystemModule.ConfigureGetLocalFileOperations(builder);
+        RelationshipsModule.ConfigureGetRelationships(builder);
+        ResourceModule.ConfigureListResourcesToProcess(builder);
+        ResourceModule.ConfigureIsResourceInFileSystem(builder);
         ResourceModule.ConfigurePutResource(builder);
         ResourceModule.ConfigureDeleteResource(builder);
-        ResourceGraphModule.ConfigureBuilder(builder);
 
-        builder.TryAddSingleton(GetRunPublisher);
+        builder.TryAddSingleton(ResolveRunPublisher);
     }
 
-    private static RunPublisher GetRunPublisher(IServiceProvider provider)
+    private static RunPublisher ResolveRunPublisher(IServiceProvider provider)
     {
-        var listResourcesToPut = provider.GetRequiredService<ListResourcesToPut>();
-        var listResourcesToDelete = provider.GetRequiredService<ListResourcesToDelete>();
-        var graph = provider.GetRequiredService<ResourceGraph>();
+        var commitIdWasPassed = provider.GetRequiredService<CommitIdWasPassed>();
+        var getCurrentCommitFileOperations = provider.GetRequiredService<GetCurrentCommitFileOperations>();
+        var getPreviousCommitFileOperations = provider.GetRequiredService<GetPreviousCommitFileOperations>();
+        var getLocalFileOperations = provider.GetRequiredService<GetLocalFileOperations>();
+        var getRelationships = provider.GetRequiredService<GetRelationships>();
+        var listResourcesToProcess = provider.GetRequiredService<ListResourcesToProcess>();
+        var isInFileSystem = provider.GetRequiredService<IsResourceInFileSystem>();
         var putResource = provider.GetRequiredService<PutResource>();
         var deleteResource = provider.GetRequiredService<DeleteResource>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
         var logger = provider.GetRequiredService<ILogger>();
+
+        var cache = new ConcurrentDictionary<ResourceKey, Lazy<Task>>();
 
         return async cancellationToken =>
         {
@@ -43,84 +52,100 @@ internal static class PublisherModule
 
             logger.LogInformation("Running publisher...");
 
-            // Get dictionary for topologically sorting resources
-            var resourceOrderDictionary = graph.TopologicallySortedResources
-                                               .Select((resource, index) => (resource, index))
-                                               .ToImmutableDictionary(pair => pair.resource, pair => pair.index);
+            var resourcesToProcess = await listResourcesToProcess(cancellationToken);
+            var currentRelationships = await getCurrentRelationships(cancellationToken);
+            var previousRelationships = await getPreviousRelationships(cancellationToken);
 
-            await listResourcesToPut(cancellationToken)
-                    .GroupBy(x => x.resource)
-                    // Put resources in topological order   
-                    .OrderBy(group => resourceOrderDictionary[group.Key])
-                    .IterTask(async group => await (group.Key switch
-                    {
-                        ApiResource => putApis([.. group], cancellationToken),
-                        _ => putResources(group, cancellationToken)
-                    }), cancellationToken);
-
-            await listResourcesToDelete(cancellationToken)
-                    .GroupBy(x => x.resource)
-                    // Delete resources in reverse topological order
-                    .OrderByDescending(group => resourceOrderDictionary[group.Key])
-                    .IterTask(async group => await (group.Key switch
-                    {
-                        ApiResource => deleteApis([.. group], cancellationToken),
-                        _ => deleteResources(group, cancellationToken)
-                    }), cancellationToken);
+            await processResources(resourcesToProcess, currentRelationships, previousRelationships, cancellationToken);
 
             logger.LogInformation("Publisher completed successfully.");
         };
 
-        async ValueTask putApis(ICollection<(IResourceWithDto Resource, ResourceName Name, ResourceAncestors Ancestors)> apis, CancellationToken cancellationToken)
+        async ValueTask<Relationships> getCurrentRelationships(CancellationToken cancellationToken)
         {
-            var currentRevisions = new List<(IResourceWithDto Resource, ResourceName Name, ResourceAncestors Ancestors)>();
-            var nonCurrentRevisions = new List<(IResourceWithDto Resource, ResourceName Name, ResourceAncestors Ancestors)>();
+            var fileOperations = commitIdWasPassed()
+                                    ? getCurrentCommitFileOperations()
+                                        .IfNone(() => throw new InvalidOperationException("Cannot get file operations for current commit."))
+                                    : getLocalFileOperations();
 
-            apis.Iter(api =>
-            {
-                if (ApiRevisionModule.IsRootName(api.Name))
-                {
-                    currentRevisions.Add(api);
-                }
-                else
-                {
-                    nonCurrentRevisions.Add(api);
-                }
-            }, cancellationToken);
-
-            await putResources(currentRevisions, cancellationToken);
-            await putResources(nonCurrentRevisions, cancellationToken);
+            return await getRelationships(fileOperations, cancellationToken);
         }
 
-        async ValueTask putResources(IEnumerable<(IResourceWithDto Resource, ResourceName Name, ResourceAncestors Ancestors)> resources, CancellationToken cancellationToken) =>
-            await resources.IterTaskParallel(async resource => await putResource(resource.Resource, resource.Name, resource.Ancestors, cancellationToken),
+        async ValueTask<Relationships> getPreviousRelationships(CancellationToken cancellationToken)
+        {
+            // No commit ID was passed, so we can't access history
+            if (commitIdWasPassed() is false)
+            {
+                return Relationships.Empty;
+            }
+
+            // If we can get the previous commit ID, map previous relationships
+            var fileOperationsOption = getPreviousCommitFileOperations();
+
+            var relationshipsOption = await fileOperationsOption.MapTask(async operations => await getRelationships(operations, cancellationToken));
+
+            // Otherwise, return an empty set of relationships
+            return relationshipsOption.IfNone(() => Relationships.Empty);
+        }
+
+        async ValueTask processResources(ImmutableHashSet<ResourceKey> resources, Relationships currentRelationships, Relationships previousRelationships, CancellationToken cancellationToken) =>
+            await resources.IterTaskParallel(async resource => await processResource(resource, resources, currentRelationships, previousRelationships, cancellationToken),
                                              maxDegreeOfParallelism: Option.None,
                                              cancellationToken);
 
-        async ValueTask deleteApis(ICollection<(IResourceWithDto Resource, ResourceName Name, ResourceAncestors Ancestors)> apis, CancellationToken cancellationToken)
+        async ValueTask processResource(ResourceKey resourceKey, ImmutableHashSet<ResourceKey> resourceSet, Relationships currentRelationships, Relationships previousRelationships, CancellationToken cancellationToken)
         {
-            var currentRevisions = new List<(IResourceWithDto Resource, ResourceName Name, ResourceAncestors Ancestors)>();
-            var nonCurrentRevisions = new List<(IResourceWithDto Resource, ResourceName Name, ResourceAncestors Ancestors)>();
+            await cache.GetOrAdd(resourceKey, _ => new Lazy<Task>(processInner))
+                       .Value;
 
-            apis.Iter(api =>
+            async Task processInner()
             {
-                if (ApiRevisionModule.IsRootName(api.Name))
+
+                if (await isInFileSystem(resourceKey, cancellationToken))
                 {
-                    currentRevisions.Add(api);
+                    await processPut();
                 }
                 else
                 {
-                    nonCurrentRevisions.Add(api);
+                    await processDelete();
                 }
-            }, cancellationToken);
+            }
 
-            await deleteResources(nonCurrentRevisions, cancellationToken);
-            await deleteResources(currentRevisions, cancellationToken);
+            async ValueTask processPut()
+            {
+                // Process predecessors first
+                var predecessors = currentRelationships.Predecessors
+                                                       .Find(resourceKey)
+                                                       .IfNone(() => []);
+
+                await predecessors.IterTaskParallel(async predecessor => await processResource(predecessor, resourceSet, currentRelationships, previousRelationships, cancellationToken),
+                                                    maxDegreeOfParallelism: Option.None,
+                                                    cancellationToken);
+
+                // Put the resource
+                if (resourceSet.Contains(resourceKey))
+                {
+                    await putResource(resourceKey, cancellationToken);
+                }
+            }
+
+            async ValueTask processDelete()
+            {
+                // Process successors first
+                var successors = previousRelationships.Successors
+                                                      .Find(resourceKey)
+                                                      .IfNone(() => []);
+
+                await successors.IterTaskParallel(async successor => await processResource(successor, resourceSet, currentRelationships, previousRelationships, cancellationToken),
+                                                  maxDegreeOfParallelism: Option.None,
+                                                  cancellationToken);
+
+                // Delete resource
+                if (resourceSet.Contains(resourceKey))
+                {
+                    await deleteResource(resourceKey, cancellationToken);
+                }
+            }
         }
-
-        async ValueTask deleteResources(IEnumerable<(IResourceWithDto Resource, ResourceName Name, ResourceAncestors Ancestors)> resources, CancellationToken cancellationToken) =>
-            await resources.IterTaskParallel(async resource => await deleteResource(resource.Resource, resource.Name, resource.Ancestors, cancellationToken),
-                                             maxDegreeOfParallelism: Option.None,
-                                             cancellationToken);
     }
 }

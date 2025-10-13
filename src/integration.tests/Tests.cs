@@ -1,4 +1,4 @@
-﻿using common;
+using common;
 using CsCheck;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -21,17 +21,19 @@ internal static class IntegrationTestsModule
     {
         ServiceModule.ConfigureEmptyService(builder);
         ServiceModule.ConfigurePopulateService(builder);
-        ResourceGraphModule.ConfigureBuilder(builder);
+        ResourceGraphModule.ConfigureResourceGraph(builder);
         ExtractorModule.ConfigureRunExtractor(builder);
         ExtractorModule.ConfigureValidateExtractor(builder);
         PublisherModule.ConfigureRunPublisher(builder);
         PublisherModule.ConfigureValidatePublisherWithoutCommit(builder);
         PublisherModule.ConfigureValidatePublisherWithCommit(builder);
         FileSystemModule.ConfigureWriteGitCommits(builder);
-        builder.TryAddSingleton(GetRunIntegrationTests);
+        ManagementServiceModule.ConfigureServiceDirectory(builder);
+
+        builder.TryAddSingleton(ResolveRunIntegrationTests);
     }
 
-    private static RunIntegrationTests GetRunIntegrationTests(IServiceProvider provider)
+    private static RunIntegrationTests ResolveRunIntegrationTests(IServiceProvider provider)
     {
         var emptyService = provider.GetRequiredService<EmptyService>();
         var populateService = provider.GetRequiredService<PopulateService>();
@@ -42,6 +44,8 @@ internal static class IntegrationTestsModule
         var validatePublisherWithoutCommit = provider.GetRequiredService<ValidatePublisherWithoutCommit>();
         var validatePublisherWithCommit = provider.GetRequiredService<ValidatePublisherWithCommit>();
         var writeGitCommits = provider.GetRequiredService<WriteGitCommits>();
+        var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
+
         var activitySource = provider.GetRequiredService<ActivitySource>();
         var logger = provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger>();
 
@@ -73,7 +77,6 @@ internal static class IntegrationTestsModule
             }, iter: 1, threads: 1, seed: seedOption.IfNoneNull());
         };
 
-#pragma warning disable CS8321 // Local function is declared but never used
         async ValueTask testExtractor(TestParameters parameters, CancellationToken cancellationToken)
         {
             await cleanUp(parameters, cancellationToken);
@@ -84,17 +87,16 @@ internal static class IntegrationTestsModule
             var extractorSubset = parameters.ExtractorParameters.SubsetToExtract;
             var extractorOptions = new ExtractorOptions
             {
-                ServiceDirectory = parameters.ServiceDirectory,
+                ServiceDirectory = serviceDirectory,
                 Models = extractorSubset
             };
             await runExtractor(extractorOptions, cancellationToken);
 
-            await validateExtractor(extractorModels, extractorSubset, parameters.ServiceDirectory, cancellationToken);
+            await validateExtractor(extractorModels, extractorSubset, serviceDirectory, cancellationToken);
         }
 
         async ValueTask cleanUp(TestParameters parameters, CancellationToken cancellationToken)
         {
-            var serviceDirectory = parameters.ServiceDirectory;
             serviceDirectory.ToDirectoryInfo().DeleteIfExists();
             await emptyService(cancellationToken);
         }
@@ -106,7 +108,7 @@ internal static class IntegrationTestsModule
             var extractorOverrides = parameters.PublisherParameters.ExtractorOverrides;
             var publisherOptions = new PublisherOptions
             {
-                ServiceDirectory = parameters.ServiceDirectory,
+                ServiceDirectory = serviceDirectory,
                 JsonOverrides = extractorOverrides
             };
             await runPublisher(publisherOptions, cancellationToken);
@@ -119,7 +121,6 @@ internal static class IntegrationTestsModule
             await cleanUp(parameters, cancellationToken);
 
             // Write Git commits
-            var serviceDirectory = parameters.ServiceDirectory;
             var publisherParameters = parameters.PublisherParameters;
             var commitIds = await writeGitCommits(publisherParameters.ModelChain, serviceDirectory, cancellationToken);
 
@@ -137,21 +138,22 @@ internal static class IntegrationTestsModule
                                                 : publisherParameters.ModelChain[index - 1]
                         };
 
-            await tests.IterTask(async test =>
-            {
-                var publisherOptions = new PublisherOptions
-                {
-                    ServiceDirectory = serviceDirectory,
-                    CommitId = test.CommitId,
-                    JsonOverrides = test.Overrides
-                };
+            await tests.IterTask(async test => await testPublisherWithCommit(serviceDirectory, test.CommitId, test.Overrides, test.Models, test.PreviousModels, cancellationToken), cancellationToken);
+        }
 
-                await runPublisher(publisherOptions, cancellationToken);
-                await validatePublisherWithCommit(test.Models, test.Overrides, test.PreviousModels, cancellationToken);
-            }, cancellationToken);
+        async ValueTask testPublisherWithCommit(ServiceDirectory serviceDirectory, CommitId commitId, Option<JsonObject> testOverrides, ResourceModels testModels, Option<ResourceModels> previousModels, CancellationToken cancellationToken)
+        {
+            var publisherOptions = new PublisherOptions
+            {
+                ServiceDirectory = serviceDirectory,
+                CommitId = commitId,
+                JsonOverrides = testOverrides
+            };
+
+            await runPublisher(publisherOptions, cancellationToken);
+            await validatePublisherWithCommit(testModels, testOverrides, previousModels, cancellationToken);
         }
     }
-#pragma warning restore CS8321 // Local function is declared but never used
 }
 
 file sealed record ExtractorParameters
@@ -218,18 +220,18 @@ file sealed record PublisherParameters
 
 file sealed record TestParameters
 {
-    public required ServiceDirectory ServiceDirectory { get; init; }
+    //public required ServiceDirectory ServiceDirectory { get; init; }
     public required ExtractorParameters ExtractorParameters { get; init; }
     public required PublisherParameters PublisherParameters { get; init; }
 
     public static Gen<TestParameters> Generate(ResourceGraph graph) =>
-        from serviceDirectory in Generator.ServiceDirectory
+        //from serviceDirectory in Generator.ServiceDirectory
         from extractorParameters in ExtractorParameters.Generate(graph)
         let publisherExtractorParameters = extractorParameters.SubsetToExtract.IfNone(() => extractorParameters.Models)
         from publisherParameters in PublisherParameters.Generate(publisherExtractorParameters, graph)
         select new TestParameters
         {
-            ServiceDirectory = serviceDirectory,
+            //ServiceDirectory = serviceDirectory,
             ExtractorParameters = extractorParameters,
             PublisherParameters = publisherParameters
         };
@@ -237,7 +239,7 @@ file sealed record TestParameters
     public JsonObject Serialize() =>
         new JsonObject
         {
-            ["serviceDirectory"] = ServiceDirectory.ToDirectoryInfo().FullName,
+            //["serviceDirectory"] = ServiceDirectory.ToDirectoryInfo().FullName,
             ["extractorParameters"] = ExtractorParameters.Serialize(),
             ["publisherParameters"] = PublisherParameters.Serialize()
         };

@@ -51,7 +51,9 @@ internal sealed record SubscriptionModel : IResourceWithReferenceTestModel<Subsc
                            }
                            select (model, updatedPredecessors);
 
-        return Generator.GenerateNodes(baseline, GenerateUpdate, newGenerator);
+        // Do not generate subscriptions with the same name
+        return from set in Generator.GenerateNodes(baseline, GenerateUpdate, newGenerator)
+               select ModelNodeSet.From(set.DistinctBy(node => node.Model.Name));
     }
 
     private static Gen<SubscriptionModel> Generate(Option<ResourceName> productName, Option<ResourceName> apiName) =>

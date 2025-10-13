@@ -1,33 +1,50 @@
-﻿using common;
+using common;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System;
-using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.IO;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace publisher;
 
+internal delegate Option<FileOperations> GetCurrentCommitFileOperations();
+internal delegate Option<FileOperations> GetPreviousCommitFileOperations();
 internal delegate Option<CommitId> GetCurrentCommitId();
 internal delegate Option<CommitId> GetPreviousCommitId();
 internal delegate bool CommitIdWasPassed();
-internal delegate ValueTask<Option<BinaryData>> ReadCurrentCommitFile(FileInfo file, CancellationToken cancellationToken);
-internal delegate ValueTask<Option<BinaryData>> ReadPreviousCommitFile(FileInfo file, CancellationToken cancellationToken);
-internal delegate Option<ImmutableHashSet<FileInfo>> ListCurrentCommitServiceDirectoryFiles();
 internal delegate Option<ImmutableDictionary<GitAction, ImmutableHashSet<FileInfo>>> ListServiceDirectoryFilesModifiedByCurrentCommit();
-internal delegate Option<IEnumerable<DirectoryInfo>> GetCurrentCommitSubDirectories(DirectoryInfo directory);
-internal delegate Option<IEnumerable<DirectoryInfo>> GetPreviousCommitSubDirectories(DirectoryInfo directory);
 
 internal static class GitModule
 {
-    public static void ConfigureGetCurrentCommitId(IHostApplicationBuilder builder) =>
-        builder.TryAddSingleton(GetGetCurrentCommitId);
+    public static void ConfigureGetCurrentCommitFileOperations(IHostApplicationBuilder builder)
+    {
+        ConfigureGetCurrentCommitId(builder);
+        ManagementServiceModule.ConfigureServiceDirectory(builder);
 
-    private static GetCurrentCommitId GetGetCurrentCommitId(IServiceProvider provider)
+        builder.TryAddSingleton(ResolveGetCurrentCommitFileOperations);
+    }
+
+    private static GetCurrentCommitFileOperations ResolveGetCurrentCommitFileOperations(IServiceProvider provider)
+    {
+        var getCurrentCommitId = provider.GetRequiredService<GetCurrentCommitId>();
+        var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
+
+        return () =>
+            getCurrentCommitId()
+                .Map(commitId => new FileOperations
+                {
+                    ReadFile = async (file, cancellationToken) => await common.GitModule.ReadFile(file, commitId, cancellationToken),
+                    GetSubDirectories = directory => common.GitModule.GetSubDirectories(commitId, directory),
+                    EnumerateServiceDirectoryFiles = () => common.GitModule.GetCommitFiles(commitId, serviceDirectory.ToDirectoryInfo())
+                });
+    }
+
+    private static void ConfigureGetCurrentCommitId(IHostApplicationBuilder builder) =>
+        builder.TryAddSingleton(ResolveGetCurrentCommitId);
+
+    private static GetCurrentCommitId ResolveGetCurrentCommitId(IServiceProvider provider)
     {
         var configuration = provider.GetRequiredService<IConfiguration>();
         var logger = provider.GetRequiredService<ILogger>();
@@ -49,103 +66,124 @@ internal static class GitModule
         return () => lazy.Value;
     }
 
-    public static void ConfigureGetPreviousCommitId(IHostApplicationBuilder builder)
+    public static void ConfigureGetPreviousCommitFileOperations(IHostApplicationBuilder builder)
+    {
+        ConfigureGetPreviousCommitId(builder);
+        ManagementServiceModule.ConfigureServiceDirectory(builder);
+
+        builder.TryAddSingleton(ResolveGetPreviousCommitFileOperations);
+    }
+
+    private static GetPreviousCommitFileOperations ResolveGetPreviousCommitFileOperations(IServiceProvider provider)
+    {
+        var getPreviousCommitId = provider.GetRequiredService<GetPreviousCommitId>();
+        var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
+
+        return () =>
+            getPreviousCommitId()
+                .Map(commitId => new FileOperations
+                {
+                    ReadFile = async (file, cancellationToken) => await common.GitModule.ReadFile(file, commitId, cancellationToken),
+                    GetSubDirectories = directory => common.GitModule.GetSubDirectories(commitId, directory),
+                    EnumerateServiceDirectoryFiles = () => common.GitModule.GetCommitFiles(commitId, serviceDirectory.ToDirectoryInfo())
+                });
+    }
+
+    private static void ConfigureGetPreviousCommitId(IHostApplicationBuilder builder)
     {
         ConfigureGetCurrentCommitId(builder);
         ManagementServiceModule.ConfigureServiceDirectory(builder);
 
-        builder.TryAddSingleton(GetGetPreviousCommitId);
+        builder.TryAddSingleton(ResolveGetPreviousCommitId);
     }
 
-    private static GetPreviousCommitId GetGetPreviousCommitId(IServiceProvider provider)
+    private static GetPreviousCommitId ResolveGetPreviousCommitId(IServiceProvider provider)
     {
         var getCurrentCommitId = provider.GetRequiredService<GetCurrentCommitId>();
         var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
 
         return () =>
             getCurrentCommitId()
-                .Map(commitId => common.GitModule
-                                       .GetPreviousCommitId(commitId, serviceDirectory.ToDirectoryInfo())
-                                       .IfNone(() => throw new InvalidOperationException($"No previous commit ID found for commit '{commitId}' in {serviceDirectory}.")));
+                .Bind(commitId => common.GitModule.GetPreviousCommitId(commitId, serviceDirectory.ToDirectoryInfo()));
     }
 
     public static void ConfigureCommitIdWasPassed(IHostApplicationBuilder builder)
     {
         ConfigureGetCurrentCommitId(builder);
 
-        builder.TryAddSingleton(GetCommitIdWasPassed);
+        builder.TryAddSingleton(ResolveCommitIdWasPassed);
     }
 
-    private static CommitIdWasPassed GetCommitIdWasPassed(IServiceProvider provider)
+    private static CommitIdWasPassed ResolveCommitIdWasPassed(IServiceProvider provider)
     {
         var getCurrentCommitId = provider.GetRequiredService<GetCurrentCommitId>();
 
         return () => getCurrentCommitId().IsSome;
     }
 
-    public static void ConfigureReadCurrentCommitFile(IHostApplicationBuilder builder)
-    {
-        ManagementServiceModule.ConfigureServiceDirectory(builder);
+    // public static void ConfigureReadCurrentCommitFile(IHostApplicationBuilder builder)
+    // {
+    //     ManagementServiceModule.ConfigureServiceDirectory(builder);
 
-        builder.TryAddSingleton(GetReadCurrentCommitFile);
-    }
+    //     builder.TryAddSingleton(ResolveReadCurrentCommitFile);
+    // }
 
-    private static ReadCurrentCommitFile GetReadCurrentCommitFile(IServiceProvider provider)
-    {
-        var getCommitId = provider.GetRequiredService<GetCurrentCommitId>();
+    // private static ReadCurrentCommitFile ResolveReadCurrentCommitFile(IServiceProvider provider)
+    // {
+    //     var getCommitId = provider.GetRequiredService<GetCurrentCommitId>();
 
-        return async (file, cancellationToken) =>
-            await getCommitId()
-                    .BindTask(commitId => common.GitModule
-                                                .ReadFile(file, commitId, cancellationToken));
-    }
+    //     return async (file, cancellationToken) =>
+    //         await getCommitId()
+    //                 .BindTask(commitId => common.GitModule
+    //                                             .ReadFile(file, commitId, cancellationToken));
+    // }
 
-    public static void ConfigureReadPreviousCommitFile(IHostApplicationBuilder builder)
-    {
-        ConfigureGetPreviousCommitId(builder);
+    // public static void ConfigureReadPreviousCommitFile(IHostApplicationBuilder builder)
+    // {
+    //     ConfigureGetPreviousCommitId(builder);
 
-        builder.TryAddSingleton(GetReadPreviousCommitFile);
-    }
+    //     builder.TryAddSingleton(ResolveReadPreviousCommitFile);
+    // }
 
-    private static ReadPreviousCommitFile GetReadPreviousCommitFile(IServiceProvider provider)
-    {
-        var getCommitId = provider.GetRequiredService<GetPreviousCommitId>();
+    // private static ReadPreviousCommitFile ResolveReadPreviousCommitFile(IServiceProvider provider)
+    // {
+    //     var getCommitId = provider.GetRequiredService<GetPreviousCommitId>();
 
-        return async (file, cancellationToken) =>
-            await getCommitId()
-                    .BindTask(commitId => common.GitModule
-                                                .ReadFile(file, commitId, cancellationToken));
-    }
+    //     return async (file, cancellationToken) =>
+    //         await getCommitId()
+    //                 .BindTask(commitId => common.GitModule
+    //                                             .ReadFile(file, commitId, cancellationToken));
+    // }
 
-    public static void ConfigureListCurrentCommitServiceDirectoryFiles(IHostApplicationBuilder builder)
-    {
-        ConfigureGetCurrentCommitId(builder);
-        ManagementServiceModule.ConfigureServiceDirectory(builder);
+    // public static void ConfigureListCurrentCommitServiceDirectoryFiles(IHostApplicationBuilder builder)
+    // {
+    //     ConfigureGetCurrentCommitId(builder);
+    //     ManagementServiceModule.ConfigureServiceDirectory(builder);
 
-        builder.TryAddSingleton(GetListCurrentCommitServiceDirectoryFiles);
-    }
+    //     builder.TryAddSingleton(ResolveListCurrentCommitServiceDirectoryFiles);
+    // }
 
-    private static ListCurrentCommitServiceDirectoryFiles GetListCurrentCommitServiceDirectoryFiles(IServiceProvider provider)
-    {
-        var getCommitId = provider.GetRequiredService<GetCurrentCommitId>();
-        var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
+    // private static ListCurrentCommitServiceDirectoryFiles ResolveListCurrentCommitServiceDirectoryFiles(IServiceProvider provider)
+    // {
+    //     var getCommitId = provider.GetRequiredService<GetCurrentCommitId>();
+    //     var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
 
-        var repositoryDirectory = serviceDirectory.ToDirectoryInfo();
+    //     var repositoryDirectory = serviceDirectory.ToDirectoryInfo();
 
-        return () =>
-            getCommitId()
-                .Map(commitId => common.GitModule.GetCommitFiles(commitId, repositoryDirectory));
-    }
+    //     return () =>
+    //         getCommitId()
+    //             .Map(commitId => common.GitModule.GetCommitFiles(commitId, repositoryDirectory));
+    // }
 
     public static void ConfigureListServiceDirectoryFilesModifiedByCurrentCommit(IHostApplicationBuilder builder)
     {
         ConfigureGetCurrentCommitId(builder);
         ManagementServiceModule.ConfigureServiceDirectory(builder);
 
-        builder.TryAddSingleton(GetListServiceDirectoryFilesModifiedByCurrentCommit);
+        builder.TryAddSingleton(ResolveListServiceDirectoryFilesModifiedByCurrentCommit);
     }
 
-    private static ListServiceDirectoryFilesModifiedByCurrentCommit GetListServiceDirectoryFilesModifiedByCurrentCommit(IServiceProvider provider)
+    private static ListServiceDirectoryFilesModifiedByCurrentCommit ResolveListServiceDirectoryFilesModifiedByCurrentCommit(IServiceProvider provider)
     {
         var getCommitId = provider.GetRequiredService<GetCurrentCommitId>();
         var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
@@ -155,35 +193,27 @@ internal static class GitModule
                 .Map(commitId => common.GitModule.GetFilesModifiedByCommit(commitId, serviceDirectory.ToDirectoryInfo()));
     }
 
-    public static void ConfigureGetCurrentCommitSubDirectories(IHostApplicationBuilder builder)
-    {
-        ConfigureGetCurrentCommitId(builder);
+    // public static void ConfigureGetCurrentCommitSubDirectories(IHostApplicationBuilder builder)
+    // {
+    //     ConfigureGetCurrentCommitId(builder);
 
-        builder.TryAddSingleton(GetGetCurrentCommitSubDirectories);
-    }
+    //     builder.TryAddSingleton(ResolveGetCurrentCommitSubDirectories);
+    // }
 
-    private static GetCurrentCommitSubDirectories GetGetCurrentCommitSubDirectories(IServiceProvider provider)
-    {
-        var getCurrentCommitId = provider.GetRequiredService<GetCurrentCommitId>();
+    // private static GetCurrentCommitSubDirectories ResolveGetCurrentCommitSubDirectories(IServiceProvider provider)
+    // {
+    //     var getCurrentCommitId = provider.GetRequiredService<GetCurrentCommitId>();
 
-        return directory =>
-            getCurrentCommitId()
-                .Bind(commitId => common.GitModule.GetSubDirectories(commitId, directory));
-    }
+    //     return directory =>
+    //         getCurrentCommitId()
+    //             .Bind(commitId => common.GitModule.GetSubDirectories(commitId, directory));
+    // }
 
-    public static void ConfigureGetPreviousCommitSubDirectories(IHostApplicationBuilder builder)
-    {
-        ConfigureGetPreviousCommitId(builder);
+    // public static void ConfigureGetPreviousCommitSubDirectories(IHostApplicationBuilder builder)
+    // {
+    //     ConfigureGetPreviousCommitId(builder);
 
-        builder.TryAddSingleton(GetGetPreviousCommitSubDirectories);
-    }
+    //     builder.TryAddSingleton(ResolveGetPreviousCommitSubDirectories);
+    // }
 
-    private static GetPreviousCommitSubDirectories GetGetPreviousCommitSubDirectories(IServiceProvider provider)
-    {
-        var getPreviousCommitId = provider.GetRequiredService<GetPreviousCommitId>();
-
-        return directory =>
-            getPreviousCommitId()
-                .Bind(commitId => common.GitModule.GetSubDirectories(commitId, directory));
-    }
 }

@@ -1,5 +1,7 @@
 using common;
 using CsCheck;
+using System.Collections.Immutable;
+using System.Linq;
 
 namespace integration.tests;
 
@@ -11,7 +13,14 @@ internal sealed record ApiPolicyModel : IPolicyResourceTestModel<ApiPolicyModel>
 
     public static Gen<ModelNodeSet> GenerateNodes(ResourceModels baseline)
     {
-        var option = from predecessorsGen in Generator.GeneratePredecessors<ApiPolicyModel>(baseline)
+        var predecessorsGenOption = from set in baseline.Find(ApiResource.Instance)
+                                    let apis = set.Where(node => node.Model is ApiModel apiModel && apiModel.Type is not ApiType.WebSocket)
+                                                  .ToImmutableArray()
+                                    where apis.Length > 0
+                                    select from api in Gen.OneOfConst([.. apis])
+                                           select ModelNodeSet.From([api]);
+
+        var option = from predecessorsGen in predecessorsGenOption
                      let newGenerator = from predecessors in predecessorsGen
                                         from model in Generate()
                                         select (model, predecessors)
@@ -37,7 +46,9 @@ internal sealed record ApiPolicyModel : IPolicyResourceTestModel<ApiPolicyModel>
                         <forward-request />
                     </backend>
                     {outboundSnippet}
-                    <on-error />
+                    <on-error>
+                        <base />
+                    </on-error>
                 </policies>
                 """;
 

@@ -80,9 +80,9 @@ public sealed record AzureEnvironment(Uri AuthorityHost, string DefaultScope, Ur
 public static class AzureModule
 {
     public static void ConfigureAzureEnvironment(IHostApplicationBuilder builder) =>
-        builder.TryAddSingleton(GetAzureEnvironment);
+        builder.TryAddSingleton(ResolveAzureEnvironment);
 
-    private static AzureEnvironment GetAzureEnvironment(IServiceProvider provider)
+    private static AzureEnvironment ResolveAzureEnvironment(IServiceProvider provider)
     {
         var configuration = provider.GetRequiredService<IConfiguration>();
 
@@ -101,10 +101,10 @@ public static class AzureModule
     {
         ConfigureAzureEnvironment(builder);
 
-        builder.TryAddSingleton(GetTokenCredential);
+        builder.TryAddSingleton(ResolveTokenCredential);
     }
 
-    private static TokenCredential GetTokenCredential(IServiceProvider provider)
+    private static TokenCredential ResolveTokenCredential(IServiceProvider provider)
     {
         var environment = provider.GetRequiredService<AzureEnvironment>();
         var configuration = provider.GetRequiredService<IConfiguration>();
@@ -136,10 +136,10 @@ public static class AzureModule
         ConfigureTokenCredential(builder);
         ConfigureAzureEnvironment(builder);
 
-        builder.TryAddSingleton(GetHttpPipeline);
+        builder.TryAddSingleton(ResolveHttpPipeline);
     }
 
-    private static HttpPipeline GetHttpPipeline(IServiceProvider provider)
+    private static HttpPipeline ResolveHttpPipeline(IServiceProvider provider)
     {
         var tokenCredential = provider.GetRequiredService<TokenCredential>();
         var environment = provider.GetRequiredService<AzureEnvironment>();
@@ -164,10 +164,10 @@ public static class AzureModule
         ConfigureSubscriptionId(builder);
         ConfigureResourceGroupName(builder);
 
-        builder.Services.TryAddSingleton(GetServiceProviderUri);
+        builder.Services.TryAddSingleton(ResolveServiceProviderUri);
     }
 
-    private static ServiceProviderUri GetServiceProviderUri(IServiceProvider provider)
+    private static ServiceProviderUri ResolveServiceProviderUri(IServiceProvider provider)
     {
         var environment = provider.GetRequiredService<AzureEnvironment>();
         var subscriptionId = provider.GetRequiredService<SubscriptionId>();
@@ -191,9 +191,9 @@ public static class AzureModule
     }
 
     private static void ConfigureSubscriptionId(IHostApplicationBuilder builder) =>
-        builder.Services.TryAddSingleton(GetSubscriptionId);
+        builder.Services.TryAddSingleton(ResolveSubscriptionId);
 
-    private static SubscriptionId GetSubscriptionId(IServiceProvider provider)
+    private static SubscriptionId ResolveSubscriptionId(IServiceProvider provider)
     {
         var configuration = provider.GetRequiredService<IConfiguration>();
 
@@ -204,9 +204,9 @@ public static class AzureModule
     }
 
     private static void ConfigureResourceGroupName(IHostApplicationBuilder builder) =>
-        builder.Services.TryAddSingleton(GetResourceGroupName);
+        builder.Services.TryAddSingleton(ResolveResourceGroupName);
 
-    private static ResourceGroupName GetResourceGroupName(IServiceProvider provider)
+    private static ResourceGroupName ResolveResourceGroupName(IServiceProvider provider)
     {
         var configuration = provider.GetRequiredService<IConfiguration>();
 

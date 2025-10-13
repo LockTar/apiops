@@ -1,6 +1,10 @@
-﻿using System;
+using Azure.Core.Pipeline;
+using System;
 using System.Collections.Immutable;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace common;
 
@@ -22,7 +26,7 @@ public sealed record ApiReleaseResource : IResourceWithReference, IChildResource
 
     public IResource Parent { get; } = ApiResource.Instance;
 
-    public ImmutableDictionary<IResource, string> MandatoryReferencedResourceDtoProperties { get; } =
+    public ImmutableDictionary<IResource, string> OptionalReferencedResourceDtoProperties { get; } =
         ImmutableDictionary.Create<IResource, string>()
                            .Add(ApiResource.Instance, nameof(ApiReleaseDto.Properties.ApiId));
 
@@ -44,5 +48,47 @@ public sealed record ApiReleaseDto
         [JsonPropertyName("notes")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? Notes { get; init; }
+    }
+}
+
+public static partial class ResourceModule
+{
+    private static async ValueTask PutApiReleaseInApim(ResourceName name,
+                                                       JsonObject dto,
+                                                       ParentChain ancestors,
+                                                       HttpPipeline pipeline,
+                                                       ServiceUri serviceUri,
+                                                       CancellationToken cancellationToken)
+    {
+        var resource = ApiReleaseResource.Instance;
+        var resourceKey = new ResourceKey
+        {
+            Parents = ancestors,
+            Name = name,
+            Resource = resource
+        };
+
+        var uri = resource.GetUri(name, ancestors, serviceUri);
+        var formattedDto = formatDto(dto);
+        var result = await pipeline.PutJson(uri, formattedDto, cancellationToken);
+        result.IfErrorThrow();
+
+        JsonObject formatDto(JsonObject dtoJson)
+        {
+            var serializerOptions = ((IResourceWithDto)resource).SerializerOptions;
+
+            var result = from dto in JsonNodeModule.To<ApiReleaseDto>(dtoJson, serializerOptions)
+                         let formattedDto = dto with
+                         {
+                             Properties = dto.Properties with
+                             {
+                                 ApiId = dto.Properties.ApiId ?? ancestors.ToResourceId()
+                             }
+                         }
+                         from formattedJson in JsonObjectModule.From(formattedDto, serializerOptions)
+                         select formattedJson;
+
+            return result.IfError(_ => dtoJson);
+        }
     }
 }

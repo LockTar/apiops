@@ -30,32 +30,41 @@ public sealed record SubscriptionResource : IResourceWithReference
     public static ResourceName Master { get; } = ResourceName.From("master").IfErrorThrow();
 }
 
+
 public sealed record SubscriptionDto
 {
     [JsonPropertyName("properties")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public required SubscriptionContract Properties { get; init; }
 
     public sealed record SubscriptionContract
     {
         [JsonPropertyName("displayName")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? DisplayName { get; init; }
 
         [JsonPropertyName("scope")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? Scope { get; init; }
 
         [JsonPropertyName("allowTracing")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public bool? AllowTracing { get; init; }
 
         [JsonPropertyName("ownerId")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? OwnerId { get; init; }
 
         [JsonPropertyName("primaryKey")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? PrimaryKey { get; init; }
 
         [JsonPropertyName("secondaryKey")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? SecondaryKey { get; init; }
 
         [JsonPropertyName("state")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? State { get; init; }
     }
 }

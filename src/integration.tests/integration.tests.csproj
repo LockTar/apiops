@@ -14,9 +14,9 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-		<PackageReference Include="Bogus" Version="35.6.3" />
+		<PackageReference Include="Bogus" Version="35.6.4" />
 		<PackageReference Include="CsCheck" Version="4.4.1" />
-		<PackageReference Include="FluentAssertions" Version="8.6.0" />
+		<PackageReference Include="FluentAssertions" Version="8.7.1" />
 	</ItemGroup>
 
 	<ItemGroup>

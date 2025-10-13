@@ -1,4 +1,3 @@
-using Azure.Core.Pipeline;
 using common;
 using DotNext.Threading;
 using Microsoft.Extensions.DependencyInjection;
@@ -6,92 +5,80 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace publisher;
 
-internal delegate ValueTask<Option<int>> GetCurrentFileSystemApiRevision(ResourceName apiName, ResourceAncestors ancestors, CancellationToken cancellationToken);
-internal delegate ValueTask PutApi(ResourceName name, ResourceAncestors ancestors, JsonObject dto, CancellationToken cancellationToken);
+internal delegate ValueTask PutApi(ResourceName name, JsonObject dto, CancellationToken cancellationToken);
+internal delegate ValueTask DeleteApi(ResourceName name, CancellationToken cancellationToken);
 
-internal static class ApiModule
+internal static partial class ResourceModule
 {
-    public static void ConfigureGetCurrentFileSystemApiRevision(IHostApplicationBuilder builder)
-    {
-        ManagementServiceModule.ConfigureServiceDirectory(builder);
-        CommonModule.ConfigureReadCurrentFile(builder);
-        builder.TryAddSingleton(GetGetCurrentFileSystemApiRevision);
-    }
-
-    private static GetCurrentFileSystemApiRevision GetGetCurrentFileSystemApiRevision(IServiceProvider provider)
-    {
-        var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
-        var readCurrentFile = provider.GetRequiredService<ReadCurrentFile>();
-
-        var cache = new ConcurrentDictionary<(ResourceName, ResourceAncestors), AsyncLazy<Option<int>>>();
-
-        return async (name, ancestors, cancellationToken) =>
-        {
-            var rootName = ApiRevisionModule.GetRootName(name);
-            var resource = ApiResource.Instance;
-
-            var lazy = cache.GetOrAdd((rootName, ancestors),
-                                       _ => new(async cancellationToken =>
-                                            from json in await resource.GetInformationFileDto(rootName, ancestors, serviceDirectory, readCurrentFile.Invoke, cancellationToken)
-                                            from dto in JsonNodeModule.To<ApiDto>(json, ((IResourceWithDto)resource).SerializerOptions).ToOption()
-                                            from revision in int.TryParse(dto.Properties.ApiRevision, out var revision) ? Option.Some(revision) : Option.None
-                                            select revision));
-
-            return await lazy.WithCancellation(cancellationToken);
-        };
-    }
-
     public static void ConfigurePutApi(IHostApplicationBuilder builder)
     {
-        ManagementServiceModule.ConfigureServiceUri(builder);
-        AzureModule.ConfigureHttpPipeline(builder);
-        builder.TryAddSingleton(GetPutApi);
+        CommonModule.ConfigureGetCurrentFileOperations(builder);
+        common.ResourceModule.ConfigureDoesResourceExistInApim(builder);
+        common.ResourceModule.ConfigureGetResourceDtoFromApim(builder);
+        common.ResourceModule.ConfigurePutResourceInApim(builder);
+        common.ResourceModule.ConfigureDeleteResourceFromApim(builder);
+        common.ResourceModule.ConfigureGetApiSpecificationFromFile(builder);
+        common.ResourceModule.ConfigurePutApiSpecificationInApim(builder);
+        ConfigureGetDto(builder);
+
+        builder.TryAddSingleton(ResolvePutApi);
     }
 
-    private static PutApi GetPutApi(IServiceProvider provider)
+    private static PutApi ResolvePutApi(IServiceProvider provider)
     {
-        var serviceUri = provider.GetRequiredService<ServiceUri>();
-        var pipeline = provider.GetRequiredService<HttpPipeline>();
+        var getCurrentFileOperations = provider.GetRequiredService<GetCurrentFileOperations>();
+        var doesResourceExistInApim = provider.GetRequiredService<DoesResourceExistInApim>();
+        var getDtoFromApim = provider.GetRequiredService<GetResourceDtoFromApim>();
+        var putResourceInApim = provider.GetRequiredService<PutResourceInApim>();
+        var deleteResourceFromApim = provider.GetRequiredService<DeleteResourceFromApim>();
+        var getSpecification = provider.GetRequiredService<GetApiSpecificationFromFile>();
+        var putSpecificationInApim = provider.GetRequiredService<PutApiSpecificationInApim>();
         var logger = provider.GetRequiredService<ILogger>();
 
         var resource = ApiResource.Instance;
+        var parents = ParentChain.Empty;
 
-        return async (name, ancestors, dto, cancellationToken) =>
+        return putApi;
+
+        async ValueTask putApi(ResourceName name, JsonObject dto, CancellationToken cancellationToken)
         {
-            var uri = resource.GetUri(name, ancestors, serviceUri);
-
             if (ApiRevisionModule.IsRootName(name))
             {
-                await updateCurrentApiRevision(name, dto, ancestors, cancellationToken);
+                await setCurrentRevision(name, dto, parents, cancellationToken);
             }
 
-            await resource.PutDto(name, dto, ancestors, serviceUri, pipeline, cancellationToken);
-        };
+            await putResourceInApim(resource, name, dto, parents, cancellationToken);
 
-        async ValueTask updateCurrentApiRevision(ResourceName name, JsonObject dto, ResourceAncestors ancestors, CancellationToken cancellationToken)
+            await putSpecification(name, cancellationToken);
+        }
+
+
+        async ValueTask setCurrentRevision(ResourceName name, JsonObject dto, ParentChain parents, CancellationToken cancellationToken)
         {
-            // If the API already exists...
-            if (await resource.Exists(name, ancestors, serviceUri, pipeline, cancellationToken))
+            var resourceKey = new ResourceKey
             {
-                // Get its existing revision number
-                var currentRevisionResult = from apiDtoJson in await resource.GetDto(name, ancestors, serviceUri, pipeline, cancellationToken)
-                                            from revision in getApiRevision(apiDtoJson)
-                                            select revision;
-                var currentRevision = currentRevisionResult.IfErrorThrow();
+                Parents = parents,
+                Resource = resource,
+                Name = name
+            };
 
-                // Get the new revision number
-                var newRevision = getApiRevision(dto).IfErrorThrow();
+            // If the API already exists...
+            if (await doesResourceExistInApim(resourceKey, cancellationToken))
+            {
+                var apimRevision = await getApimRevision(name, cancellationToken);
+                var newRevision = GetApiRevisionFromDto(dto);
 
                 // If the revision numbers are different...
-                if (currentRevision != newRevision)
+                if (apimRevision != newRevision)
                 {
-                    logger.LogInformation("Changing the revision of {Resource} '{Name}'{Ancestors} from {PreviousRevision} to {NewRevision}...", resource.SingularName, name, ancestors.ToLogString(), currentRevision, newRevision);
+                    logger.LogInformation("Changing the revision of {ResourceKey} from {PreviousRevision} to {NewRevision}...", resourceKey, apimRevision, newRevision);
 
                     // Create the revisioned API
                     var revisionedName = ApiRevisionModule.Combine(name, newRevision);
@@ -101,44 +88,141 @@ internal static class ApiModule
                         Properties = new()
                         {
                             ApiRevision = newRevision.ToString(),
-                            SourceApiId = ancestors.Append(resource, name).ToResourceId()
+                            SourceApiId = parents.Append(resource, name).ToResourceId()
                         }
                     }).IfErrorThrow();
 
-                    await resource.PutDto(revisionedName, revisionDto, ancestors, serviceUri, pipeline, cancellationToken);
+                    await putResourceInApim(resource, revisionedName, revisionDto, parents, cancellationToken);
 
                     // Then create a release to make it current
-                    await makeApiCurrent(revisionedName, ancestors, cancellationToken);
+                    await makeApiCurrent(revisionedName, cancellationToken);
                 }
             }
         }
 
-        async ValueTask makeApiCurrent(ResourceName name, ResourceAncestors ancestors, CancellationToken cancellationToken)
+        async ValueTask<int> getApimRevision(ResourceName name, CancellationToken cancellationToken)
+        {
+            var dtoJson = await getDtoFromApim(resource, name, parents, cancellationToken);
+
+            return GetApiRevisionFromDto(dtoJson);
+        }
+
+        async ValueTask makeApiCurrent(ResourceName name, CancellationToken cancellationToken)
         {
             var releaseName = ResourceName.From($"apiops-set-current-{Guid.NewGuid().ToString()[..8]}")
                                           .IfErrorThrow();
 
-            var releaseAncestors = ancestors.Append(resource, name);
+            var releaseParents = parents.Append(resource, name);
 
             var releaseDto = JsonObjectModule.From(new ApiReleaseDto
             {
                 Properties = new()
                 {
-                    ApiId = releaseAncestors.ToResourceId(),
+                    ApiId = releaseParents.ToResourceId(),
                     Notes = "Setting current revision for ApiOps"
                 }
             }).IfErrorThrow();
 
             var releaseResource = ApiReleaseResource.Instance;
-            await releaseResource.PutDto(releaseName, releaseDto, releaseAncestors, serviceUri, pipeline, cancellationToken);
-            await releaseResource.Delete(releaseName, releaseAncestors, serviceUri, pipeline, cancellationToken);
+            await putResourceInApim(releaseResource, releaseName, releaseDto, releaseParents, cancellationToken);
+
+            var releaseResourceKey = new ResourceKey
+            {
+                Parents = releaseParents,
+                Resource = releaseResource,
+                Name = releaseName
+            };
+
+            await deleteResourceFromApim(releaseResourceKey, ignoreNotFound: true, waitForCompletion: true, cancellationToken);
         }
 
-        Result<int> getApiRevision(JsonObject json) =>
-            from dto in JsonNodeModule.To<ApiDto>(json, ((IResourceWithDto)resource).SerializerOptions)
-            from revisionNumber in int.TryParse(dto.Properties.ApiRevision, out var number)
-                                    ? Result.Success(number)
-                                    : Error.From($"Could not parse revision number from JSON {json.ToJsonString()}.")
-            select revisionNumber;
+        async ValueTask putSpecification(ResourceName name, CancellationToken cancellationToken)
+        {
+            var fileOperations = getCurrentFileOperations();
+
+            var specificationOption = await getSpecification(name, fileOperations.ReadFile, cancellationToken);
+
+            await specificationOption.IterTask(async specification => await putSpecificationInApim(name, specification.Specification, specification.Contents, cancellationToken));
+        }
+    }
+
+    private static int GetApiRevisionFromDto(JsonObject dtoJson)
+    {
+        var serializerOptions = ((IResourceWithDto)ApiResource.Instance).SerializerOptions;
+
+        var result = from dto in JsonNodeModule.To<ApiDto>(dtoJson, serializerOptions)
+                     from revisionNumber in int.TryParse(dto.Properties.ApiRevision, out var number)
+                                             ? Result.Success(number)
+                                             : Error.From($"Could not parse revision number from JSON {dtoJson.ToJsonString()}.")
+                     select revisionNumber;
+
+        return result.IfErrorThrow();
+    }
+
+    private static void ConfigureDeleteApi(IHostApplicationBuilder builder)
+    {
+        common.ResourceModule.ConfigureDoesResourceExistInApim(builder);
+        common.ResourceModule.ConfigureDeleteResourceFromApim(builder);
+        ConfigureGetDto(builder);
+
+        builder.TryAddSingleton(ResolveDeleteApi);
+    }
+
+    private static DeleteApi ResolveDeleteApi(IServiceProvider provider)
+    {
+        var doesResourceExistInApim = provider.GetRequiredService<DoesResourceExistInApim>();
+        var deleteResourceFromApim = provider.GetRequiredService<DeleteResourceFromApim>();
+        var getDto = provider.GetRequiredService<GetDto>();
+        var logger = provider.GetRequiredService<ILogger>();
+
+        var currentRevisionCache = new ConcurrentDictionary<ResourceName, AsyncLazy<Option<int>>>();
+        var resource = ApiResource.Instance;
+        var parents = ParentChain.Empty;
+
+        return async (name, cancellationToken) =>
+        {
+            if (await isCurrentApiRevision(name, cancellationToken))
+            {
+                logger.LogInformation("Skipping deletion of current API revision '{Name}'...", name);
+                return;
+            }
+
+            var resourceKey = new ResourceKey
+            {
+                Parents = parents,
+                Resource = resource,
+                Name = name
+            };
+
+            await deleteResourceFromApim(resourceKey, ignoreNotFound: true, waitForCompletion: true, cancellationToken);
+        };
+
+        // Check if the resource has a revisioned name but is the current API. This handles scenarios like this:
+        // 1. Create apiA with two revisions: revision 1 and revision 2. The current revision is revision 1.
+        // 2. Run the extractor. There will be two folders: apiA (revision 1, current) and apiA;rev2 (revision 2, not current).
+        // 3. Make revision 2 the current revision.
+        // 4. Run the extractor again. There will be two folders: apiA (revision 2, current) and apiA;rev1 (revision 1, not current).
+        // 5. When we run the publisher, apiA;rev2 appear in the list of deleted folders. We don't want to delete revision 2 though, as it's now the current revision.
+        async ValueTask<bool> isCurrentApiRevision(ResourceName name, CancellationToken cancellationToken)
+        {
+            var option = await ApiRevisionModule.Parse(name)
+                                                .BindTask(async x =>
+                                                {
+                                                    var (_, revision) = x;
+
+                                                    return from currentRevision in await getCurrentRevision(name, cancellationToken)
+                                                           select currentRevision == revision;
+                                                });
+
+            return option.IfNone(() => false);
+        }
+
+        async ValueTask<Option<int>> getCurrentRevision(ResourceName name, CancellationToken cancellationToken) =>
+            await currentRevisionCache.GetOrAdd(ApiRevisionModule.GetRootName(name), rootName => new(async cancellationToken =>
+            {
+                return from dto in await getDto(resource, rootName, parents, cancellationToken)
+                       let revision = GetApiRevisionFromDto(dto)
+                       select revision;
+            })).WithCancellation(cancellationToken);
     }
 }

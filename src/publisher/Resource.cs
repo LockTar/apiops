@@ -1,14 +1,13 @@
-﻿using Azure.Core.Pipeline;
 using common;
+using DotNext.Threading;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System;
-using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
@@ -16,362 +15,341 @@ using System.Threading.Tasks;
 
 namespace publisher;
 
-internal delegate ValueTask<Option<(IResourceWithDto resource, ResourceName name, ResourceAncestors ancestors)>> ParseFile(FileInfo file, ReadFile readFile, CancellationToken cancellationToken);
-internal delegate IAsyncEnumerable<(IResourceWithDto resource, ResourceName name, ResourceAncestors ancestors)> ListResourcesToPut(CancellationToken cancellationToken);
-internal delegate IAsyncEnumerable<(IResourceWithDto resource, ResourceName name, ResourceAncestors ancestors)> ListResourcesToDelete(CancellationToken cancellationToken);
-internal delegate ValueTask PutResource(IResourceWithDto resource, ResourceName name, ResourceAncestors ancestors, CancellationToken cancellationToken);
-internal delegate ValueTask<Option<JsonObject>> GetDto(IResourceWithDto resource, ResourceName name, ResourceAncestors ancestors, CancellationToken cancellationToken);
-internal delegate ValueTask DeleteResource(IResourceWithDto resource, ResourceName name, ResourceAncestors ancestors, CancellationToken cancellationToken);
+internal delegate ValueTask<ImmutableHashSet<ResourceKey>> ListResourcesToProcess(CancellationToken cancellationToken);
+internal delegate ValueTask<bool> IsResourceInFileSystem(ResourceKey key, CancellationToken cancellationToken);
+internal delegate ValueTask PutResource(ResourceKey resourceKey, CancellationToken cancellationToken);
+internal delegate ValueTask<Option<JsonObject>> GetDto(IResourceWithDto resource, ResourceName name, ParentChain parents, CancellationToken cancellationToken);
+internal delegate ValueTask DeleteResource(ResourceKey resourceKey, CancellationToken cancellationToken);
 
-internal static class ResourceModule
+internal static partial class ResourceModule
 {
-    public static void ConfigureParseFile(IHostApplicationBuilder builder)
+    public static void ConfigureListResourcesToProcess(IHostApplicationBuilder builder)
     {
-        ManagementServiceModule.ConfigureServiceDirectory(builder);
-        ResourceGraphModule.ConfigureBuilder(builder);
-
-        builder.TryAddSingleton(GetParseFile);
-    }
-
-    private static ParseFile GetParseFile(IServiceProvider provider)
-    {
-        var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
-        var graph = provider.GetRequiredService<ResourceGraph>();
-        var activitySource = provider.GetRequiredService<ActivitySource>();
-
-        var potentialResources = graph.TopologicallySortedResources
-                                      .Choose(resource => resource is IResourceWithDto resourceWithDto
-                                                            ? Option.Some(resourceWithDto)
-                                                            : Option.None)
-                                      .ToImmutableArray();
-
-        return async (file, readFile, cancellationToken) =>
-        {
-            using var _ = activitySource.StartActivity("parse.file")
-                                       ?.AddTag("file", file.FullName);
-
-            var matches = await potentialResources.Choose(async resource =>
-            {
-                var option = Option<(IResourceWithDto resource, ResourceName name, ResourceAncestors ancestors)>.None();
-
-                if (resource is ILinkResource linkResource)
-                {
-                    option = from x in await linkResource.ParseInformationFile(file, serviceDirectory, readFile, cancellationToken)
-                             select (resource, x.Name, x.Ancestors);
-
-                    if (option.IsSome)
-                    {
-                        return option;
-                    }
-                }
-
-                if (resource is IResourceWithInformationFile resourceWithInformationFile and not ILinkResource)
-                {
-                    option = from x in resourceWithInformationFile.ParseInformationFile(file, serviceDirectory)
-                             select (resource, x.Name, x.Ancestors);
-
-                    if (option.IsSome)
-                    {
-                        return option;
-                    }
-                }
-
-                if (resource is IPolicyResource policyResource)
-                {
-                    option = from x in policyResource.ParsePolicyFile(file, serviceDirectory)
-                             select (resource, x.Name, x.Ancestors);
-
-                    if (option.IsSome)
-                    {
-                        return option;
-                    }
-                }
-
-                return Option.None;
-            }).ToArrayAsync(cancellationToken);
-
-            switch (matches)
-            {
-                case []:
-                    return Option.None;
-                case [var match]:
-                    return match;
-                default:
-                    var matchesAsString = string.Join(", ", matches.Select(match => $"{match.resource.SingularName} {match.name}"));
-                    throw new InvalidOperationException($"Multiple resources matched the file '{file.FullName}': {matchesAsString}.");
-            }
-        };
-    }
-
-    public static void ConfigureListResourcesToPut(IHostApplicationBuilder builder)
-    {
+        common.ResourceModule.ConfigureParseResourceFile(builder);
         GitModule.ConfigureCommitIdWasPassed(builder);
         GitModule.ConfigureListServiceDirectoryFilesModifiedByCurrentCommit(builder);
-        FileSystemModule.ConfigureListLocalServiceDirectoryFiles(builder);
-        CommonModule.ConfigureReadCurrentFile(builder);
-        ConfigureParseFile(builder);
+        GitModule.ConfigureGetCurrentCommitFileOperations(builder);
+        GitModule.ConfigureGetPreviousCommitFileOperations(builder);
+        FileSystemModule.ConfigureGetLocalFileOperations(builder);
 
-        builder.TryAddSingleton(GetListResourcesToPut);
+        builder.TryAddSingleton(ResolveListResourcesToProcess);
     }
 
-    private static ListResourcesToPut GetListResourcesToPut(IServiceProvider provider)
+    private static ListResourcesToProcess ResolveListResourcesToProcess(IServiceProvider provider)
     {
+        var parseFile = provider.GetRequiredService<ParseResourceFile>();
         var commitIdWasPassed = provider.GetRequiredService<CommitIdWasPassed>();
-        var listFilesModifiedByCommit = provider.GetRequiredService<ListServiceDirectoryFilesModifiedByCurrentCommit>();
-        var listServiceDirectoryFiles = provider.GetRequiredService<ListLocalServiceDirectoryFiles>();
-        var readCurrentFile = provider.GetRequiredService<ReadCurrentFile>();
-        var parseFile = provider.GetRequiredService<ParseFile>();
-        var activitySource = provider.GetRequiredService<ActivitySource>();
+        var listCommitFiles = provider.GetRequiredService<ListServiceDirectoryFilesModifiedByCurrentCommit>();
+        var getCurrentCommitFileOperations = provider.GetRequiredService<GetCurrentCommitFileOperations>();
+        var getPreviousCommitFileOperations = provider.GetRequiredService<GetPreviousCommitFileOperations>();
+        var getLocalFileOperations = provider.GetRequiredService<GetLocalFileOperations>();
 
-        return cancellationToken =>
+        return async cancellationToken =>
         {
-            using var _ = activitySource.StartActivity("list.resources.to.put");
-
-            IEnumerable<FileInfo> files = [];
+            var resources = new ConcurrentBag<ResourceKey>();
 
             if (commitIdWasPassed())
             {
-                var option = from fileDictionary in listFilesModifiedByCommit()
-                             select from kvp in fileDictionary
-                                    where kvp.Key != GitAction.Delete
-                                    from file in kvp.Value
-                                    select file;
-
-                files = option.IfNoneThrow(() => new InvalidOperationException("No commit ID was passed."));
-            }
-            else
-            {
-                files = listServiceDirectoryFiles();
-            }
-
-            return files.ToAsyncEnumerable()
-                        .Choose(async file => await parseFile(file, readCurrentFile.Invoke, cancellationToken))
-                        .SelectMany(x => (x.resource switch
+                await listCommitFiles()
+                        .IfNone(() => throw new InvalidOperationException("Could not get files modified by current commit."))
+                        .IterTaskParallel(async kvp =>
                         {
-                            // If this is a revisioned API, also include the root API
-                            ApiResource when ApiRevisionModule.IsRootName(x.name) is false =>
-                                new[] { x, (x.resource, ApiRevisionModule.GetRootName(x.name), x.ancestors) },
-                            _ => [x]
-                        }).ToAsyncEnumerable())
-                        .Distinct();
-        };
-    }
+                            var (action, files) = kvp;
 
-    public static void ConfigureListResourcesToDelete(IHostApplicationBuilder builder)
-    {
-        GitModule.ConfigureCommitIdWasPassed(builder);
-        GitModule.ConfigureListServiceDirectoryFilesModifiedByCurrentCommit(builder);
-        GitModule.ConfigureReadPreviousCommitFile(builder);
-        GitModule.ConfigureReadCurrentCommitFile(builder);
-        ManagementServiceModule.ConfigureServiceDirectory(builder);
-        ApiModule.ConfigureGetCurrentFileSystemApiRevision(builder);
-        ConfigureParseFile(builder);
+                            var fileOperations = getFileOperations(action);
 
-        builder.TryAddSingleton(GetListResourcesToDelete);
-    }
-
-    private static ListResourcesToDelete GetListResourcesToDelete(IServiceProvider provider)
-    {
-        var commitIdWasPassed = provider.GetRequiredService<CommitIdWasPassed>();
-        var listFilesModifiedByCommit = provider.GetRequiredService<ListServiceDirectoryFilesModifiedByCurrentCommit>();
-        var readPreviousCommitFile = provider.GetRequiredService<ReadPreviousCommitFile>();
-        var readCurrentCommitFile = provider.GetRequiredService<ReadCurrentCommitFile>();
-        var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
-        var parseFile = provider.GetRequiredService<ParseFile>();
-        var getCurrentFileSystemApiRevision = provider.GetRequiredService<GetCurrentFileSystemApiRevision>();
-        var activitySource = provider.GetRequiredService<ActivitySource>();
-
-        return cancellationToken =>
-        {
-            using var _ = activitySource.StartActivity("list.resources.to.delete");
-
-            if (commitIdWasPassed())
-            {
-                var fileDictionary = listFilesModifiedByCommit()
-                                         .IfNoneThrow(() => new InvalidOperationException("No commit ID was passed."));
-
-                return fileDictionary.Where(kvp => kvp.Key == GitAction.Delete)
-                                     .SelectMany(kvp => kvp.Value)
-                                     .Choose(async file => await parseFile(file, readPreviousCommitFile.Invoke, cancellationToken))
-                                     .Where(async (x, cancellationToken) => await isCurrentApiRevision(x.resource, x.name, x.ancestors, cancellationToken) is false)
-                                     .Distinct();
+                            await files.IterTaskParallel(async file => await processFileResource(file, fileOperations, resources.Add, cancellationToken),
+                                                         maxDegreeOfParallelism: Option.None,
+                                                         cancellationToken);
+                        }, maxDegreeOfParallelism: Option.None, cancellationToken);
             }
             else
             {
-                return AsyncEnumerable.Empty<(IResourceWithDto resource, ResourceName name, ResourceAncestors ancestors)>();
+                var fileOperations = getLocalFileOperations();
+
+                await fileOperations.EnumerateServiceDirectoryFiles()
+                                    .IterTaskParallel(async file => await processFileResource(file, fileOperations, resources.Add, cancellationToken),
+                                                      maxDegreeOfParallelism: Option.None,
+                                                      cancellationToken);
             }
+
+            return [.. resources];
         };
 
-        // Check if the resource is a current API revision with a revisioned name. This handles scenarios like this:
-        // 1. Create apiA with two revisions: revision 1 and revision 2. The current revision is revision 1.
-        // 2. Run the extractor. There will be two folders: apiA (revision 1, current) and apiA;rev2 (revision 2, not current).
-        // 3. Make revision 2 the current revision.
-        // 4. Run the extractor again. There will be two folders: apiA (revision 2, current) and apiA;rev1 (revision 1, not current).
-        // 5. When we run the publisher, apiA;rev2 appear in the list of deleted folders. We don't want to delete it though, as it's now the current revision.
-        async ValueTask<bool> isCurrentApiRevision(IResourceWithDto resource, ResourceName name, ResourceAncestors ancestors, CancellationToken cancellationToken) =>
-            resource is ApiResource
-            && await ApiRevisionModule.Parse(name)
-                                      .Match(async x =>
-                                             {
-                                                 var (_, revisionNumber) = x;
+        FileOperations getFileOperations(GitAction action) =>
+            action is GitAction.Delete
+                ? getPreviousCommitFileOperations()
+                    .IfNone(() => throw new InvalidOperationException("Could not get file operations for previous commit."))
+                : getCurrentCommitFileOperations()
+                    .IfNone(() => throw new InvalidOperationException("Could not get file operations for current commit."));
 
-                                                 var option = from currentRevision in await getCurrentFileSystemApiRevision(name, ancestors, cancellationToken)
-                                                              select currentRevision == revisionNumber;
+        async ValueTask processFileResource(FileInfo file, FileOperations fileOperations, Action<ResourceKey> action, CancellationToken cancellationToken)
+        {
+            var resourceOption = await parseFile(file, fileOperations.ReadFile, cancellationToken);
+            resourceOption.Iter(action);
+        }
+    }
 
-                                                 return option.IfNone(() => false);
-                                             },
-                                             async () => await ValueTask.FromResult(false));
+    public static void ConfigureIsResourceInFileSystem(IHostApplicationBuilder builder)
+    {
+        GitModule.ConfigureCommitIdWasPassed(builder);
+        GitModule.ConfigureGetCurrentCommitFileOperations(builder);
+        FileSystemModule.ConfigureGetLocalFileOperations(builder);
+        common.ResourceModule.ConfigureGetInformationFileDto(builder);
+        common.ResourceModule.ConfigureGetPolicyFileContents(builder);
+        common.ResourceModule.ConfigureGetApiSpecificationFromFile(builder);
+
+        builder.TryAddSingleton(ResolveIsResourceInFileSystem);
+    }
+
+    private static IsResourceInFileSystem ResolveIsResourceInFileSystem(IServiceProvider provider)
+    {
+        var commitIdWasPassed = provider.GetRequiredService<CommitIdWasPassed>();
+        var getCurrentCommitFileOperations = provider.GetRequiredService<GetCurrentCommitFileOperations>();
+        var getLocalFileOperations = provider.GetRequiredService<GetLocalFileOperations>();
+        var getInformationFileDto = provider.GetRequiredService<GetInformationFileDto>();
+        var getPolicy = provider.GetRequiredService<GetPolicyFileContents>();
+        var getApiSpecification = provider.GetRequiredService<GetApiSpecificationFromFile>();
+
+        var cache = new ConcurrentDictionary<ResourceKey, AsyncLazy<bool>>();
+
+        return async (key, cancellationToken) =>
+        {
+            return await cache.GetOrAdd(key, _ => new(isInFileSystem))
+                              .WithCancellation(cancellationToken);
+
+            async Task<bool> isInFileSystem(CancellationToken cancellationToken)
+            {
+                var fileOperations = commitIdWasPassed()
+                                     ? getCurrentCommitFileOperations()
+                                           .IfNone(() => throw new InvalidOperationException("Could not get file operations for current commit."))
+                                     : getLocalFileOperations();
+
+                var readFile = fileOperations.ReadFile;
+                var getSubDirectories = fileOperations.GetSubDirectories;
+
+                // Parse the resource's information file
+                if (key.Resource is IResourceWithInformationFile resourceWithInformationFile
+                    && await getInformationFileDto(resourceWithInformationFile, key.Name, key.Parents, readFile.Invoke, getSubDirectories, cancellationToken) is { IsSome: true })
+                {
+                    return true;
+                }
+
+                // Parse the resource's policy file
+                if (key.Resource is IPolicyResource policyResource
+                    && await getPolicy(policyResource, key.Name, key.Parents, readFile.Invoke, cancellationToken) is { IsSome: true })
+                {
+                    return true;
+                }
+
+                // Parse the resource's API specification file
+                if (key.Resource is ApiResource apiResource
+                    && await getApiSpecification(key.Name, readFile.Invoke, cancellationToken) is { IsSome: true })
+                {
+                    return true;
+                }
+
+                return false;
+            }
+        };
     }
 
     public static void ConfigurePutResource(IHostApplicationBuilder builder)
     {
         ConfigureGetDto(builder);
-        ManagementServiceModule.ConfigureServiceUri(builder);
-        AzureModule.ConfigureHttpPipeline(builder);
-        ApiModule.ConfigurePutApi(builder);
-        ProductApiModule.ConfigurePutProductApi(builder);
+        ConfigurePutApi(builder);
 
-        builder.TryAddSingleton(GetPutResource);
+        common.ResourceModule.ConfigurePutResourceInApim(builder);
+
+        builder.TryAddSingleton(ResolvePutResource);
     }
 
-    private static PutResource GetPutResource(IServiceProvider provider)
+    private static PutResource ResolvePutResource(IServiceProvider provider)
     {
         var getDto = provider.GetRequiredService<GetDto>();
-        var serviceUri = provider.GetRequiredService<ServiceUri>();
-        var pipeline = provider.GetRequiredService<HttpPipeline>();
         var putApi = provider.GetRequiredService<PutApi>();
-        var putProductApi = provider.GetRequiredService<PutProductApi>();
+        var putResourceInApim = provider.GetRequiredService<PutResourceInApim>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
         var logger = provider.GetRequiredService<ILogger>();
 
-        return async (resource, name, ancestors, cancellationToken) =>
+        return async (resourceKey, cancellationToken) =>
         {
             using var _ = activitySource.StartActivity("put.resource")
-                                       ?.SetTag("resource", resource.SingularName)
-                                       ?.SetTag("name", name.ToString())
-                                       ?.TagAncestors(ancestors);
+                                       ?.SetTag("resourceKey", resourceKey);
 
-            logger.LogInformation("Putting {Resource} '{Name}'{Ancestors}...", resource.SingularName, name, ancestors.ToLogString());
+            // Skip non-DTO resources
+            if (resourceKey.Resource is not IResourceWithDto resourceWithDto)
+            {
+                logger.LogWarning("Cannot put {ResourceKey} as it is not a resource with DTO. Skipping it...", resourceKey);
 
-            var dtoOption = await getDto(resource, name, ancestors, cancellationToken);
+                return;
+            }
 
-            await dtoOption.IterTask(async dto => await putDto(resource, name, dto, ancestors, cancellationToken));
+            var (name, parents) = (resourceKey.Name, resourceKey.Parents);
+            var dtoOption = await getDto(resourceWithDto, name, parents, cancellationToken);
+
+            // If we have a DTO, put it; otherwise, log and skip it.
+            await dtoOption.Match(async dto =>
+                                  {
+                                      logger.LogInformation("Putting {ResourceKey}...", resourceKey);
+
+                                      await putDtoResource(resourceWithDto, name, dto, parents, cancellationToken);
+                                  },
+                                  async () =>
+                                  {
+                                      logger.LogWarning("No DTO found for {ResourceKey}. Skipping it...", resourceKey);
+
+                                      await ValueTask.CompletedTask;
+                                  });
         };
 
-        async ValueTask putDto(IResourceWithDto resource, ResourceName name, JsonObject dto, ResourceAncestors ancestors, CancellationToken cancellationToken) =>
+        async ValueTask putDtoResource(IResourceWithDto resource, ResourceName name, JsonObject dto, ParentChain parents, CancellationToken cancellationToken) =>
             await (resource switch
             {
-                ApiResource => putApi(name, ancestors, dto, cancellationToken),
-                ProductApiResource => putProductApi(name, ancestors, dto, cancellationToken),
-                _ => resource.PutDto(name, dto, ancestors, serviceUri, pipeline, cancellationToken)
+                ApiResource => putApi(name, dto, cancellationToken),
+                _ => putResourceInApim(resource, name, dto, parents, cancellationToken)
             });
     }
 
     private static void ConfigureGetDto(IHostApplicationBuilder builder)
     {
-        CommonModule.ConfigureReadCurrentFile(builder);
-        CommonModule.ConfigureGetSubDirectories(builder);
-        ManagementServiceModule.ConfigureServiceDirectory(builder);
+        GitModule.ConfigureCommitIdWasPassed(builder);
+        GitModule.ConfigureGetCurrentCommitFileOperations(builder);
+        FileSystemModule.ConfigureGetLocalFileOperations(builder);
+        common.ResourceModule.ConfigureGetInformationFileDto(builder);
+        common.ResourceModule.ConfigureGetPolicyFileContents(builder);
+        ConfigureGetPolicyFragmentDto(builder);
         ConfigurationModule.ConfigureGetConfigurationOverride(builder);
 
-        builder.TryAddSingleton(GetGetDto);
+        builder.TryAddSingleton(ResolveGetDto);
     }
 
-    private static GetDto GetGetDto(IServiceProvider provider)
+    private static GetDto ResolveGetDto(IServiceProvider provider)
     {
-        var readCurrentFile = provider.GetRequiredService<ReadCurrentFile>();
-        var getSubDirectories = provider.GetRequiredService<GetSubDirectories>();
-        var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
+        var commitIdWasPassed = provider.GetRequiredService<CommitIdWasPassed>();
+        var getCurrentCommitFileOperations = provider.GetRequiredService<GetCurrentCommitFileOperations>();
+        var getLocalFileOperations = provider.GetRequiredService<GetLocalFileOperations>();
+
+        var getInformationFileDto = provider.GetRequiredService<GetInformationFileDto>();
+        var getPolicyFileContents = provider.GetRequiredService<GetPolicyFileContents>();
+        var getPolicyFragmentDto = provider.GetRequiredService<GetPolicyFragmentDto>();
         var getConfigurationOverride = provider.GetRequiredService<GetConfigurationOverride>();
         var logger = provider.GetRequiredService<ILogger>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
 
-        return async (resource, name, ancestors, cancellationToken) =>
+        return async (resource, name, parents, cancellationToken) =>
         {
-            using var _ = activitySource.StartActivity("get.dto")
-                                       ?.SetTag("resource", resource.SingularName)
-                                       ?.SetTag("name", name.ToString())
-                                       ?.TagAncestors(ancestors);
+            var resourceKey = new ResourceKey
+            {
+                Resource = resource,
+                Name = name,
+                Parents = parents
+            };
 
-            var dtoOption = Option<JsonObject>.None();
+            using var _ = activitySource.StartActivity("get.dto")
+                                       ?.SetTag("resourceKey", resourceKey);
+
+            var dtoOption = await getDtoFromFileSystem(resource, name, parents, cancellationToken);
+
+            dtoOption = await mergeDtoWithConfigurationOverride(resourceKey, dtoOption, cancellationToken);
+
+            dtoOption = validateNamedValue(resource, name, dtoOption);
+
+            return dtoOption;
+        };
+
+        async ValueTask<Option<JsonObject>> getDtoFromFileSystem(IResourceWithDto resource, ResourceName name, ParentChain parents, CancellationToken cancellationToken)
+        {
+            var fileOperations = getFileOperations();
+            var readFile = fileOperations.ReadFile;
+            var getSubDirectories = fileOperations.GetSubDirectories;
 
             switch (resource)
             {
-                case PolicyFragmentResource policyFragmentResource:
-                    var informationFileOption = await policyFragmentResource.GetInformationFileDto(name, ancestors, serviceDirectory, readCurrentFile.Invoke, cancellationToken);
-                    var policyFileOption = await policyFragmentResource.GetPolicyFileDto(name, ancestors, serviceDirectory, readCurrentFile.Invoke, cancellationToken);
-
-                    dtoOption = (informationFileOption.IfNoneNull(), policyFileOption.IfNoneNull()) switch
-                    {
-                        (null, null) => dtoOption,
-                        (JsonObject informationFile, null) => informationFile,
-                        (null, JsonObject policyFile) => policyFile,
-                        (JsonObject informationFile, JsonObject policyFile) => informationFile.MergeWith(policyFile)
-                    };
-
-                    break;
-                case ILinkResource linkResource:
-                    dtoOption = await linkResource.GetInformationFileDto(name, ancestors, serviceDirectory, getSubDirectories.Invoke, readCurrentFile.Invoke, cancellationToken);
-                    break;
+                case PolicyFragmentResource:
+                    return await getPolicyFragmentDto(name, cancellationToken);
                 case IResourceWithInformationFile resourceWithInformationFile:
-                    dtoOption = await resourceWithInformationFile.GetInformationFileDto(name, ancestors, serviceDirectory, readCurrentFile.Invoke, cancellationToken);
-                    break;
+                    return await getInformationFileDto(resourceWithInformationFile, name, parents, readFile, getSubDirectories, cancellationToken);
                 case IPolicyResource policyResource:
-                    dtoOption = await policyResource.GetPolicyFileDto(name, ancestors, serviceDirectory, readCurrentFile.Invoke, cancellationToken);
-                    break;
+                    var policyContentsOption = await getPolicyFileContents(policyResource, name, parents, readFile, cancellationToken);
+                    return policyContentsOption.Map(PolicyContentsToDto);
                 default:
-                    break;
+                    return Option.None;
             }
+        }
 
-            // Add the configuration override if it exists
-            await dtoOption.IterTask(async json =>
+        FileOperations getFileOperations() =>
+            commitIdWasPassed()
+                ? getCurrentCommitFileOperations()
+                    .IfNone(() => throw new InvalidOperationException("Could not get file operations for current commit."))
+                : getLocalFileOperations();
+
+        async ValueTask<Option<JsonObject>> mergeDtoWithConfigurationOverride(ResourceKey resourceKey, Option<JsonObject> dtoOption, CancellationToken cancellationToken) =>
+            await dtoOption.MapTask(async dto =>
             {
-                var overrideOption = await getConfigurationOverride(resource, name, ancestors, cancellationToken);
-                overrideOption.Iter(overrideJson => dtoOption = json.MergeWith(overrideJson));
+                var option = from configurationOverride in await getConfigurationOverride(resourceKey, cancellationToken)
+                             select dto.MergeWith(configurationOverride);
+
+                return option.IfNone(() => dto);
             });
 
-            var json = dtoOption.IfNoneThrow(() => new InvalidOperationException($"Failed to get DTO for {resource.SingularName} '{name}'{ancestors.ToLogString()}."));
-
-            // Don't put secret named values without a value or Key Vault identifier
-            if (resource is NamedValueResource
-                && json.Deserialize<NamedValueDto>() is NamedValueDto namedValueDto
-                && namedValueDto.Properties.Secret is true
-                && namedValueDto.Properties.Value is null
-                && namedValueDto.Properties.KeyVault?.SecretIdentifier is null)
+        Option<JsonObject> validateNamedValue(IResource resource, ResourceName name, Option<JsonObject> dtoOption) =>
+            dtoOption.Bind(json =>
             {
-                logger.LogWarning("Named value '{Name}' is secret but has no value or key vault identifier. Skipping it...", name);
-                return Option.None;
-            }
-
-            return json;
-        };
+                // Don't put secret named values without a value or Key Vault identifier
+                if (resource is NamedValueResource
+                    && json.Deserialize<NamedValueDto>() is NamedValueDto namedValueDto
+                    && namedValueDto.Properties.Secret is true
+                    && namedValueDto.Properties.Value is null
+                    && namedValueDto.Properties.KeyVault?.SecretIdentifier is null)
+                {
+                    logger.LogWarning("Named value '{Name}' is secret but has no value or key vault identifier. Skipping it...", name);
+                    return Option<JsonObject>.None();
+                }
+                else
+                {
+                    return json;
+                }
+            });
     }
+
+    private static JsonObject PolicyContentsToDto(BinaryData contents) =>
+        new()
+        {
+            ["properties"] = new JsonObject
+            {
+                ["format"] = "rawxml",
+                ["value"] = contents.ToString()
+            }
+        };
 
     public static void ConfigureDeleteResource(IHostApplicationBuilder builder)
     {
-        ManagementServiceModule.ConfigureServiceUri(builder);
-        AzureModule.ConfigureHttpPipeline(builder);
+        common.ResourceModule.ConfigureDeleteResourceFromApim(builder);
+        ConfigureDeleteApi(builder);
 
-        builder.TryAddSingleton(GetDeleteResource);
+        builder.TryAddSingleton(ResolveDeleteResource);
     }
 
-    private static DeleteResource GetDeleteResource(IServiceProvider provider)
+    private static DeleteResource ResolveDeleteResource(IServiceProvider provider)
     {
-        var serviceUri = provider.GetRequiredService<ServiceUri>();
-        var pipeline = provider.GetRequiredService<HttpPipeline>();
+        var deleteResourceFromApim = provider.GetRequiredService<DeleteResourceFromApim>();
+        var deleteApi = provider.GetRequiredService<DeleteApi>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
         var logger = provider.GetRequiredService<ILogger>();
 
-        return async (resource, name, ancestors, cancellationToken) =>
+        return async (resourceKey, cancellationToken) =>
         {
             using var _ = activitySource.StartActivity("delete.resource")
-                                       ?.SetTag("resource", resource.SingularName)
-                                       ?.SetTag("name", name.ToString())
-                                       ?.TagAncestors(ancestors);
+                                       ?.SetTag("resourceKey", resourceKey);
 
-            logger.LogInformation("Deleting {Resource} '{Name}'{Ancestors}...", resource.SingularName, name, ancestors.ToLogString());
+            logger.LogInformation("Deleting {ResourceKey}...", resourceKey);
 
-            await resource.Delete(name, ancestors, serviceUri, pipeline, cancellationToken);
+            await (resourceKey.Resource switch
+            {
+                ApiResource => deleteApi(resourceKey.Name, cancellationToken),
+                _ => deleteResourceFromApim(resourceKey, ignoreNotFound: true, waitForCompletion: true, cancellationToken)
+            });
         };
     }
 }

@@ -1,4 +1,4 @@
-﻿using Bogus;
+using Bogus;
 using Bogus.DataSets;
 using common;
 using CsCheck;
@@ -23,7 +23,7 @@ internal static class Generator
         from randomizer in Randomizer
         select new Lorem { Random = randomizer };
 
-    private static Gen<Internet> Internet { get; } =
+    public static Gen<Internet> Internet { get; } =
         from randomizer in Randomizer
         select new Internet { Random = randomizer };
 
@@ -43,8 +43,8 @@ internal static class Generator
 
     public static Gen<ResourceName> ResourceName { get; } =
         from words in AlphanumericWord.Array[1, 5]
-        where words.Sum(word => word.Length) <= 16
         let name = string.Join("-", words).ToLowerInvariant()
+        where name.Length <= 25
         select common.ResourceName.From(name)
                                   .IfErrorThrow();
 
@@ -149,37 +149,79 @@ internal static class Generator
         var nodes = models.SelectMany(kvp => kvp.Value);
 
         return from nodeSubset in Generator.SubSetOf([.. nodes])
-               let nodeSubsetWithAllApiRevisions = includeAllApiRevisions(nodeSubset)
-               let subsetWithDependencies = getNodeDependencies(nodeSubsetWithAllApiRevisions)
+               let normalizedApis = normalizeApis(nodeSubset)
+               let subsetWithDependencies = getNodeDependencies(normalizedApis)
                select ResourceModels.From(subsetWithDependencies);
 
-        // All API revisions must be included if any revision is included
-        ImmutableArray<ModelNode> includeAllApiRevisions(IEnumerable<ModelNode> subset)
+        ImmutableArray<ModelNode> normalizeApis(IEnumerable<ModelNode> subset)
         {
-            var subsetList = subset.ToList();
+            var updatedSubset = new HashSet<ModelNode>(subset);
+            var apiModels = models.Find(ApiResource.Instance)
+                                  .IfNone(() => ModelNodeSet.Empty)
+                                  .GroupBy(node => ApiRevisionModule.GetRootName(node.Model.Name))
+                                  .ToImmutableDictionary(group => group.Key,
+                                                         group => group.ToImmutableHashSet());
 
-            var subsetApiNames = subset.Choose(node => node.Model is ApiModel apiModel
-                                                        ? Option.Some(apiModel.Name)
-                                                        : Option.None)
-                                       .ToImmutableHashSet();
+            // All revisions of `apiA` must be included if any revision of `apiA` is included
+            updatedSubset.ToImmutableArray()
+                         .Choose(node => node.Model is ApiModel apiModel
+                                            ? Option.Some(ApiRevisionModule.GetRootName(apiModel.Name))
+                                            : Option.None)
+                         .Distinct()
+                         .Iter(rootName => updatedSubset.UnionWith(apiModels.Find(rootName)
+                                                                            .IfNone(() => [])));
 
-            var subsetRootApiNames = subsetApiNames.Select(ApiRevisionModule.GetRootName)
-                                                   .ToImmutableHashSet();
+            // If child `resourceX` of `apiA` is included, all revisions of `apiA` must have chiild `resourceX` included
+            updatedSubset.ToImmutableArray()
+                         .GroupBy(node => node.Model.AssociatedResource)
+                         .Where(group => group.Key is IChildResource childResource && childResource.Parent is ApiResource)
+                         .Iter(resourceGroup => resourceGroup.Select(node =>
+                                                                    {
+                                                                        var resourceName = node.Model.Name;
+                                                                        var apiName = node.Predecessors
+                                                                                            .Single(predecessor => predecessor.Model is ApiModel)
+                                                                                            .Model.Name;
+                                                                        var rootApiName = ApiRevisionModule.GetRootName(apiName);
 
-            models.Find(ApiResource.Instance)
-                  .Iter(set => set.Iter(node =>
-                  {
-                      var name = node.Model.Name;
-                      var rootName = ApiRevisionModule.GetRootName(name);
+                                                                        return new
+                                                                        {
+                                                                            ResourceName = resourceName,
+                                                                            ApiName = apiName,
+                                                                            RootApiName = rootApiName,
+                                                                            Node = node
+                                                                        };
+                                                                    })
+                                                             .GroupBy(x => (x.ResourceName, x.RootApiName))
+                                                             .Iter(nameGroup =>
+                                                             {
+                                                                 var resource = resourceGroup.Key;
+                                                                 var (resourceName, rootApiName) = nameGroup.Key;
 
-                      if (subsetRootApiNames.Contains(rootName)
-                          && subsetApiNames.Contains(name) is false)
-                      {
-                          subsetList.Add(node);
-                      }
-                  }));
+                                                                 var resourcesInModels = models.Find(resource)
+                                                                                               .IfNone(() => ModelNodeSet.Empty)
+                                                                                               .SelectMany(childNode => from apiNode in apiModels.Find(rootApiName).IfNone(() => [])
+                                                                                                                        where childNode.Predecessors.Contains(apiNode)
+                                                                                                                        where childNode.Model.Name == resourceName
+                                                                                                                        select (childNode, apiNode))
+                                                                                               .ToImmutableArray();
 
-            return [.. subsetList];
+                                                                 var resourcesInModelsApiNames = resourcesInModels.Select(x => x.apiNode.Model.Name);
+                                                                 var expectedApiNames = apiModels.Find(rootApiName)
+                                                                                                 .IfNone(() => [])
+                                                                                                 .Select(node => node.Model.Name)
+                                                                                                 .ToImmutableHashSet();
+
+                                                                 if (expectedApiNames.SetEquals(resourcesInModelsApiNames))
+                                                                 {
+                                                                     resourcesInModels.Iter(x => updatedSubset.Add(x.childNode));
+                                                                 }
+                                                                 else
+                                                                 {
+                                                                     nameGroup.Iter(x => updatedSubset.Remove(x.Node));
+                                                                 }
+                                                             }));
+
+            return [.. updatedSubset];
         }
 
         // Ensure all dependencies are included
@@ -235,7 +277,7 @@ internal static class Generator
         }
 
         JsonObject resourceModelsToJson(ResourceModels models) =>
-                graph.GetTraversalRootResources()
+                graph.ListTraversalRootResources()
                      .Aggregate(new JsonObject(),
                                 (json, resource) =>
                                 {
@@ -265,7 +307,7 @@ internal static class Generator
                 json = json.MergeWith(dtoTestModel.SerializeDto(node.Predecessors), mutateOriginal: true);
             }
 
-            var successors = from successorResource in graph.GetTraversalSuccessors(model.AssociatedResource)
+            var successors = from successorResource in graph.ListTraversalSuccessors(model.AssociatedResource)
                              let successorSet =
                                 from successor in getModelNodeSet(successorResource, models)
                                 where successor.Predecessors.Find(name, node.Predecessors).IsSome
@@ -461,6 +503,10 @@ internal static class Generator
                                             .Where(node => ApiRevisionModule.IsRootName(node.Model.Name))]),
                 // For gateway APIs, the API must be the current revision
                 GatewayApiResource =>
+                    ModelNodeSet.From([.. findInBaseline(resource.Secondary)
+                                            .Where(node => ApiRevisionModule.IsRootName(node.Model.Name))]),
+                // For tag APIs, the API must be the current revision
+                TagApiResource =>
                     ModelNodeSet.From([.. findInBaseline(resource.Secondary)
                                             .Where(node => ApiRevisionModule.IsRootName(node.Model.Name))]),
                 _ => findInBaseline(resource.Secondary)

@@ -1,4 +1,5 @@
-﻿using common;
+using Bogus.DataSets;
+using common;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using System;
@@ -21,10 +22,10 @@ internal static class FileSystemModule
     public static void ConfigureWriteGitCommits(IHostApplicationBuilder builder)
     {
         ConfigureWriteResourceModels(builder);
-        builder.TryAddSingleton(GetWriteGitCommits);
+        builder.TryAddSingleton(ResolveWriteGitCommits);
     }
 
-    private static WriteGitCommits GetWriteGitCommits(IServiceProvider provider)
+    private static WriteGitCommits ResolveWriteGitCommits(IServiceProvider provider)
     {
         var writeModels = provider.GetRequiredService<WriteResourceModels>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
@@ -85,13 +86,19 @@ internal static class FileSystemModule
     public static void ConfigureWriteResourceModels(IHostApplicationBuilder builder)
     {
         ServiceModule.ConfigureShouldSkipResource(builder);
+        ResourceModule.ConfigureWriteInformationFile(builder);
+        ResourceModule.ConfigureWriteApiSpecificationFile(builder);
+        ResourceModule.ConfigureWritePolicyFile(builder);
 
-        builder.TryAddSingleton(GetWriteResourceModels);
+        builder.TryAddSingleton(ResolveWriteResourceModels);
     }
 
-    private static WriteResourceModels GetWriteResourceModels(IServiceProvider provider)
+    private static WriteResourceModels ResolveWriteResourceModels(IServiceProvider provider)
     {
         var shouldSkipResource = provider.GetRequiredService<ShouldSkipResource>();
+        var writeInformationFile = provider.GetRequiredService<WriteInformationFile>();
+        var writeApiSpecificationFile = provider.GetRequiredService<WriteApiSpecificationFile>();
+        var writePolicyFile = provider.GetRequiredService<WritePolicyFile>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
 
         return async (models, serviceDirectory, cancellationToken) =>
@@ -109,12 +116,14 @@ internal static class FileSystemModule
         async ValueTask writeNode(ModelNode node, ResourceModels resourceModels, ConcurrentDictionary<ModelNode, Lazy<Task>> tasks, ServiceDirectory serviceDirectory, CancellationToken cancellationToken) =>
             await tasks.GetOrAdd(node, _ => new(async () =>
             {
-                var model = node.Model;
-                var resource = model.AssociatedResource;
-                var name = model.Name;
-                var ancestors = node.GetResourceAncestors();
+                var resourceKey = new ResourceKey
+                {
+                    Name = node.Model.Name,
+                    Parents = node.GetResourceParentChain(),
+                    Resource = node.Model.AssociatedResource
+                };
 
-                if (await shouldSkipResource(resource, name, ancestors, cancellationToken))
+                if (await shouldSkipResource(resourceKey, cancellationToken))
                 {
                     return;
                 }
@@ -126,20 +135,42 @@ internal static class FileSystemModule
                                                     cancellationToken);
 
                 // Write model
-                if (model is IDtoTestModel dtoTestModel)
+                if (node.Model is IDtoTestModel dtoTestModel)
                 {
+                    var name = resourceKey.Name;
                     var dto = dtoTestModel.SerializeDto(predecessors);
+                    var ancestors = resourceKey.Parents;
 
-                    if (resource is IResourceWithInformationFile resourceWithInformationFile)
+                    if (resourceKey.Resource is IResourceWithInformationFile resourceWithInformationFile)
                     {
-                        var informationFileDto = resourceWithInformationFile.FormatInformationFileDto(dto);
-                        await resourceWithInformationFile.WriteInformationFile(name, informationFileDto, ancestors, serviceDirectory, cancellationToken);
+                        await writeInformationFile(resourceWithInformationFile, name, dto, ancestors, cancellationToken);
                     }
 
-                    if (resource is IPolicyResource policyResource)
+                    if (resourceKey.Resource is IPolicyResource policyResource)
                     {
-                        await policyResource.WritePolicyFile(name, dto, ancestors, serviceDirectory, cancellationToken);
+                        await writePolicyFile(policyResource, name, dto, ancestors, cancellationToken);
                     }
+                }
+
+                // Write API specification
+                if (node.Model is ApiModel apiModel)
+                {
+                    var option = from specification in apiModel.Type switch
+                    {
+                        ApiType.Http => Option.Some<ApiSpecification>(new ApiSpecification.OpenApi
+                        {
+                            Format = OpenApiFormat.Yaml.Instance,
+                            Version = OpenApiVersion.V3.Instance,
+                        }),
+                        ApiType.Soap => ApiSpecification.Wsdl.Instance,
+                        ApiType.GraphQl => ApiSpecification.GraphQl.Instance,
+                        _ => Option.None
+                    }
+                                 from contentsString in apiModel.Specification
+                                 let contents = BinaryData.FromString(contentsString)
+                                 select (specification, contents);
+
+                    await option.IterTask(async tuple => await writeApiSpecificationFile(resourceKey.Name, tuple.specification, tuple.contents, cancellationToken));
                 }
             })).Value;
     }

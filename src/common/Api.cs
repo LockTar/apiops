@@ -1,7 +1,13 @@
+using Azure.Core.Pipeline;
+using Flurl;
 using System;
 using System.Collections.Immutable;
+using System.IO;
 using System.Linq;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace common;
 
@@ -48,6 +54,10 @@ public sealed record ApiDto
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? ApiRevisionDescription { get; init; }
 
+        [JsonPropertyName("apiType")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public string? ApiType { get; init; }
+
         [JsonPropertyName("apiVersion")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? ApiVersion { get; init; }
@@ -55,6 +65,10 @@ public sealed record ApiDto
         [JsonPropertyName("apiVersionDescription")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? ApiVersionDescription { get; init; }
+
+        [JsonPropertyName("apiVersionSet")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public ApiVersionSetContractDetails? ApiVersionSet { get; init; }
 
         [JsonPropertyName("apiVersionSetId")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -72,22 +86,6 @@ public sealed record ApiDto
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? Description { get; init; }
 
-        [JsonPropertyName("isCurrent")]
-        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public bool? IsCurrent { get; init; }
-
-        [JsonPropertyName("license")]
-        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public ApiLicenseInformation? License { get; init; }
-
-        [JsonPropertyName("apiType")]
-        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public string? ApiType { get; init; }
-
-        [JsonPropertyName("apiVersionSet")]
-        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public ApiVersionSetContractDetails? ApiVersionSet { get; init; }
-
         [JsonPropertyName("displayName")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? DisplayName { get; init; }
@@ -95,6 +93,14 @@ public sealed record ApiDto
         [JsonPropertyName("format")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? Format { get; init; }
+
+        [JsonPropertyName("isCurrent")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public bool? IsCurrent { get; init; }
+
+        [JsonPropertyName("license")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public ApiLicenseInformation? License { get; init; }
 
         [JsonPropertyName("protocols")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -110,18 +116,6 @@ public sealed record ApiDto
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? SourceApiId { get; init; }
 
-        [JsonPropertyName("translateRequiredQueryParameters")]
-        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public string? TranslateRequiredQueryParameters { get; init; }
-
-        [JsonPropertyName("value")]
-        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public string? Value { get; init; }
-
-        [JsonPropertyName("wsdlSelector")]
-        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public WsdlSelectorContract? WsdlSelector { get; init; }
-
         [JsonPropertyName("subscriptionKeyParameterNames")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public SubscriptionKeyParameterNamesContract? SubscriptionKeyParameterNames { get; init; }
@@ -136,9 +130,21 @@ public sealed record ApiDto
         public string? TermsOfServiceUrl { get; init; }
 #pragma warning restore CA1056 // URI-like properties should not be strings
 
+        [JsonPropertyName("translateRequiredQueryParameters")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public string? TranslateRequiredQueryParameters { get; init; }
+
         [JsonPropertyName("type")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? Type { get; init; }
+
+        [JsonPropertyName("value")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public string? Value { get; init; }
+
+        [JsonPropertyName("wsdlSelector")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public WsdlSelectorContract? WsdlSelector { get; init; }
 
         public record AuthenticationSettingsContract
         {
@@ -281,4 +287,87 @@ public static class ApiRevisionModule
             ? throw new InvalidOperationException($"Revision must be positive.")
             : ResourceName.From($"{rootName}{separator}{revision}")
                           .IfErrorThrow();
+}
+
+public static partial class ResourceModule
+{
+    private static async ValueTask PutApiInApim(ResourceName name, JsonObject dto, GetResourceDtoFromApim getApimDto, HttpPipeline pipeline, ServiceUri serviceUri, CancellationToken cancellationToken)
+    {
+        IResourceWithDto resource = ApiResource.Instance;
+        ParentChain parentChain = ParentChain.Empty;
+
+        var uri = resource.GetUri(name, parentChain, serviceUri);
+        var formattedDto = await formatDto();
+        var result = await pipeline.PutJson(uri, formattedDto, cancellationToken);
+        result.IfErrorThrow();
+
+        // Non-current revisions are not allowed to update certain properties.
+        // Replace them with the existing revision properties if necessary.
+        async ValueTask<JsonObject> formatDto()
+        {
+            // If this is the current revision, return the DTO as-is.
+            var rootName = ApiRevisionModule.GetRootName(name);
+            if (name == rootName)
+            {
+                return dto;
+            }
+
+            // Otherwise, update the DTO with the appropriate current revision properties.
+            var existingDto = await getApimDto(resource, rootName, parentChain, cancellationToken);
+
+            var result = from existingDtoObject in JsonNodeModule.To<ApiDto>(existingDto, resource.SerializerOptions)
+                         from newDtoObject in JsonNodeModule.To<ApiDto>(dto, resource.SerializerOptions)
+                         let formattedDtoObject = newDtoObject with
+                         {
+                             Properties = newDtoObject.Properties with
+                             {
+                                 Type = existingDtoObject.Properties.Type,
+                                 Description = existingDtoObject.Properties.Description,
+                                 SubscriptionRequired = existingDtoObject.Properties.SubscriptionRequired,
+                                 ApiVersion = existingDtoObject.Properties.ApiVersion,
+                                 ApiRevisionDescription = existingDtoObject.Properties.ApiRevisionDescription,
+                                 Path = existingDtoObject.Properties.Path,
+                                 Protocols = existingDtoObject.Properties.Protocols
+                             }
+                         }
+                         from updatedDto in JsonObjectModule.From(formattedDtoObject, resource.SerializerOptions)
+                         select updatedDto;
+
+            return result.IfErrorThrow();
+        }
+    }
+
+    /// <summary>
+    /// If the API type is not 'websocket' or 'graphql', remove the 'serviceUrl' property from the API information file DTO.
+    /// </summary>
+    private static JsonObject FormatInformationFileDto(this ApiResource resource, JsonObject dtoJson)
+    {
+        var serializerOptions = ((IResourceWithDto)resource).SerializerOptions;
+
+        var dto = JsonNodeModule.To<ApiDto>(dtoJson, serializerOptions)
+                                .IfErrorThrow();
+
+        dto = new[] { "websocket", "graphql" }.Contains(dto.Properties.Type, StringComparer.OrdinalIgnoreCase)
+                ? dto
+                : dto with { Properties = dto.Properties with { ServiceUrl = null } };
+
+        return JsonObjectModule.From(dto, serializerOptions)
+                               .IfErrorThrow();
+    }
+
+    private static Option<(ResourceName Name, ParentChain Ancestors)> ParseSpecificationFile(this ApiResource resource, FileInfo? file, ServiceDirectory serviceDirectory)
+    {
+        if (file is null)
+        {
+            return Option.None;
+        }
+
+        var specificationFileNames = specifications.Select(GetSpecificationFileName);
+        if (specificationFileNames.Contains(file.Name) is false)
+        {
+            return Option.None;
+        }
+
+        return resource.ParseDirectory(file.Directory, serviceDirectory);
+    }
 }

@@ -10,7 +10,6 @@ internal sealed record ProductModel : IDtoTestModel<ProductModel>
     public required ResourceName Name { get; init; }
     public required string State { get; init; }
     public required string Description { get; init; }
-    public required bool SubscriptionRequired { get; init; }
     public required Option<string> Terms { get; init; }
 
     public static IResourceWithDto AssociatedResource { get; } = ProductResource.Instance;
@@ -34,8 +33,7 @@ internal sealed record ProductModel : IDtoTestModel<ProductModel>
             Name = name,
             State = state,
             Description = description,
-            Terms = terms,
-            SubscriptionRequired = subscriptionRequired
+            Terms = terms
         };
 
     private static Gen<string> GenerateState() =>
@@ -53,13 +51,11 @@ internal sealed record ProductModel : IDtoTestModel<ProductModel>
         from state in GenerateState().OrConst(model.State)
         from description in GenerateDescription().OrConst(model.Description)
         from terms in GenerateTerms().OptionOf().OrConst(model.Terms)
-        from subscriptionRequired in Gen.Bool.OrConst(model.SubscriptionRequired)
         select model with
         {
             State = state,
             Description = description,
-            Terms = terms,
-            SubscriptionRequired = subscriptionRequired
+            Terms = terms
         };
 
     public JsonObject SerializeDto(ModelNodeSet predecessors) =>
@@ -70,8 +66,7 @@ internal sealed record ProductModel : IDtoTestModel<ProductModel>
                 DisplayName = Name.ToString(),
                 State = State,
                 Description = Description,
-                Terms = Terms.IfNoneNull(),
-                SubscriptionRequired = SubscriptionRequired
+                Terms = Terms.IfNoneNull()
             }
         }, AssociatedResource.SerializerOptions).IfErrorThrow();
 
@@ -87,19 +82,16 @@ internal sealed record ProductModel : IDtoTestModel<ProductModel>
         var left = new
         {
             Description = overrideDto?.Properties?.Description ?? Description,
-            Terms = overrideDto?.Properties?.Terms ?? Terms.IfNoneNull(),
-            SubscriptionRequired = overrideDto?.Properties?.SubscriptionRequired ?? SubscriptionRequired
+            Terms = overrideDto?.Properties?.Terms ?? Terms.IfNoneNull()
         };
 
         var right = new
         {
             Description = jsonDto?.Properties?.Description,
-            Terms = jsonDto?.Properties?.Terms,
-            SubscriptionRequired = jsonDto?.Properties?.SubscriptionRequired
+            Terms = jsonDto?.Properties?.Terms
         };
 
         return left.Description.FuzzyEquals(right.Description)
-               && left.Terms.FuzzyEquals(right.Terms)
-               && left.SubscriptionRequired.FuzzyEquals(right.SubscriptionRequired);
+               && left.Terms.FuzzyEquals(right.Terms);
     }
 }

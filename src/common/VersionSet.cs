@@ -34,20 +34,20 @@ public sealed record VersionSetDto
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? DisplayName { get; init; }
 
-        [JsonPropertyName("description")]
-        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public string? Description { get; init; }
-
         [JsonPropertyName("versioningScheme")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? VersioningScheme { get; init; }
 
-        [JsonPropertyName("versionQueryName")]
+        [JsonPropertyName("description")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public string? VersionQueryName { get; init; }
+        public string? Description { get; init; }
 
         [JsonPropertyName("versionHeaderName")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
         public string? VersionHeaderName { get; init; }
+
+        [JsonPropertyName("versionQueryName")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+        public string? VersionQueryName { get; init; }
     }
 }

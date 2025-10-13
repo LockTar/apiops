@@ -113,12 +113,4 @@ internal sealed record GatewayModel : IDtoTestModel<GatewayModel>
                && left.City.FuzzyEquals(right.City)
                && left.Country.FuzzyEquals(right.Country);
     }
-
-    public bool MatchesDto(JsonObject json) =>
-        JsonNodeModule.To<GatewayDto>(json, AssociatedResource.SerializerOptions)
-                      .Map(dto => Description.FuzzyEquals(dto.Properties.Description)
-                                  && LocationName.FuzzyEquals(dto.Properties.LocationData?.Name)
-                                  && City.FuzzyEquals(dto.Properties.LocationData?.City)
-                                  && Country.FuzzyEquals(dto.Properties.LocationData?.CountryOrRegion))
-                      .IfErrorThrow();
 }

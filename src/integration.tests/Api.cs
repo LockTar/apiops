@@ -8,23 +8,79 @@ using System.Text.Json.Nodes;
 
 namespace integration.tests;
 
+internal abstract record ApiType
+{
+    public sealed record Http : ApiType
+    {
+        private Http() { }
+
+        public static Http Instance { get; } = new Http();
+
+        public override string ToString() => "http";
+    }
+
+    public sealed record Soap : ApiType
+    {
+        private Soap() { }
+
+        public static Soap Instance { get; } = new Soap();
+
+        public override string ToString() => "soap";
+    }
+
+    public sealed record WebSocket : ApiType
+    {
+        private WebSocket() { }
+
+        public static WebSocket Instance { get; } = new WebSocket();
+
+        public override string ToString() => "websocket";
+    }
+
+    public sealed record GraphQl : ApiType
+    {
+        private GraphQl() { }
+
+        public static GraphQl Instance { get; } = new GraphQl();
+
+        public override string ToString() => "graphql";
+    }
+
+    public static Gen<ApiType> Generate() =>
+        Gen.OneOfConst<ApiType>(Http.Instance,
+                                Soap.Instance,
+                                WebSocket.Instance,
+                                GraphQl.Instance);
+}
+
 file sealed record ApiRevision
 {
-    public required bool IsCurrent { get; init; }
-
     public required int Number
     {
         get;
         init => field = value < 1 ? throw new InvalidOperationException("Revision must be greater than 0.") : value;
     }
 
-    public static Gen<ApiRevision> Generate() =>
-        from isCurrent in Gen.Bool
+    public required Option<string> Specification { get; init; }
+
+    public static Gen<ApiRevision> Generate(ApiType type, ResourceName rootName, Option<string> descriptionOption, Option<Uri> serviceUriOption) =>
         from number in Gen.Int[1, 100]
+        let revisionedName = ApiRevisionModule.Combine(rootName, number)
+        let description = descriptionOption.IfNone(() => string.Empty)
+        from specification in type switch
+        {
+            ApiType.Http => ApiSpecificationModule.GenerateOpenApi(revisionedName.ToString(), description).OptionOf(),
+            ApiType.Soap => from specification in ApiSpecificationModule.GenerateWsdl(serviceUriOption.IfNone(() => throw new InvalidOperationException("Soap specification must have a service URI.")),
+                                                                                      rootName.ToString())
+                            select Option.Some(specification),
+            ApiType.WebSocket => Gen.Const(Option<string>.None),
+            ApiType.GraphQl => ApiSpecificationModule.GenerateGraphQl().OptionOf(),
+            _ => throw new InvalidOperationException($"Unknown API type: {type}.")
+        }
         select new ApiRevision
         {
-            IsCurrent = isCurrent,
-            Number = number
+            Number = number,
+            Specification = specification
         };
 
     public bool Equals(ApiRevision? other) =>
@@ -38,58 +94,99 @@ file sealed record ApiRevision
 file sealed record ApiGroup
 {
     public required ResourceName RootName { get; init; }
+    public required ApiType Type { get; init; }
     public required Option<ResourceName> VersionSetName { get; init; }
-    public required ImmutableHashSet<ApiRevision> Revisions { get; init; }
-    public required string Description { get; init; }
+    public required ApiRevision CurrentRevision { get; init; }
+    public required ImmutableArray<ApiRevision> Revisions { get; init; }
+    public required Option<string> Description { get; init; }
+    public required Option<Uri> ServiceUri { get; init; }
 
     public IEnumerable<ApiModel> ToApiModels() =>
         from revision in Revisions
         select new ApiModel
         {
-            Name = revision.IsCurrent ? RootName : ApiRevisionModule.Combine(RootName, revision.Number),
+            Name = revision.Number == CurrentRevision.Number
+                    ? RootName
+                    : ApiRevisionModule.Combine(RootName, revision.Number),
             RevisionNumber = revision.Number,
             Description = Description,
-            VersionSetName = VersionSetName
+            VersionSetName = VersionSetName,
+            Type = Type,
+            ServiceUrl = ServiceUri.Map(uri => uri.ToString()),
+            Specification = revision.Specification
         };
 
     public static Gen<ApiGroup> Generate(IEnumerable<ModelNode> predecessors) =>
         from rootName in Generator.ResourceName
+        from type in ApiType.Generate()
+        from descriptionOption in GenerateDescription(type)
+        from serviceUriOption in GenerateServiceUri(type)
         let versionSetName = predecessors.PickName<VersionSetResource>()
-        from revisions in ApiRevision.Generate().HashSetOf(1, 5)
-        from description in GenerateDescription()
+        from currentRevision in from revision in ApiRevision.Generate(type, rootName, descriptionOption, serviceUriOption)
+                                select revision with { Number = 1 }
+        from otherRevisions in from revisions in ApiRevision.Generate(type, rootName, descriptionOption, serviceUriOption)
+                                                            .HashSetOf(0, 4)
+                               where revisions.Contains(currentRevision) is false
+                               select revisions
         select new ApiGroup
         {
             RootName = rootName,
             VersionSetName = versionSetName,
-            Revisions = [.. revisions.OrderBy(revision => revision.Number)
-                                     .Select((revision, index) => revision with
-                                     {
-                                         Number = index == 0 ? 1 : revision.Number, // Ensure the first revision is always 1
-                                         IsCurrent = index == 0 // The first revision is the current one
-                                     })],
-            Description = description
+            Type = type,
+            ServiceUri = serviceUriOption,
+            CurrentRevision = currentRevision,
+            Revisions = [currentRevision, .. otherRevisions],
+            Description = descriptionOption
         };
 
-    private static Gen<string> GenerateDescription() =>
-        from lorem in Generator.Lorem
-        select lorem.Paragraph();
+    private static Gen<Option<string>> GenerateDescription(ApiType type) =>
+        type switch
+        {
+            // TODO: Revisit description logic for Soap APIs.
+            // Here's a complicating scenario:
+            // 1. Create a SOAP API with a description.
+            // 2. Pass a WSDL specification that does not contain a description.
+            // 3. The description is removed.
+            // Until we find a way to embed escription in WSDL, always set the description to None.
+            ApiType.Soap => Gen.Const(Option<string>.None()),
+            _ => from lorem in Generator.Lorem
+                 let paragraph = lorem.Paragraph()
+                 select Option.Some(paragraph)
+        };
+
+    private static Gen<Option<Uri>> GenerateServiceUri(ApiType type) =>
+        type switch
+        {
+            ApiType.WebSocket => from uri in Generator.Uri
+                                 let builder = new UriBuilder(uri)
+                                 {
+                                     Scheme = "wss",
+                                     Port = -1
+                                 }
+                                 select Option.Some(builder.Uri),
+            ApiType.Soap => from uri in Generator.Uri
+                            select Option.Some(uri),
+            ApiType.GraphQl => Generator.Uri.OptionOf(),
+            _ => Generator.Uri.OptionOf()
+        };
 
     public static Gen<ApiGroup> GenerateUpdate(ApiGroup apiGroup) =>
-        from revisions in from unchanged in Gen.Const(apiGroup.Revisions)
-                          from @new in ApiRevision.Generate().HashSetOf(1, 5)
-                          from selection in Generator.SubSetOf([.. unchanged, .. @new])
-                          where selection.Count > 0
+        from revisions in from unchanged in Gen.Const(apiGroup.Revisions) // Old set of revisions
+                          from @new in ApiRevision.Generate(apiGroup.Type, apiGroup.RootName, apiGroup.Description, apiGroup.ServiceUri)
+                                                  .HashSetOf(1, 5) // New set of revisions (may be empty)
+                          from selection in Generator.SubSetOf([.. unchanged, .. @new]) // Randomly pick revisions from either set
+                          where selection.Count > 0 // Ensure at least one revision was selected
                           select selection
-        from description in GenerateDescription()
-        from currentRevision in Gen.OneOfConst([.. revisions.Select(revision => revision.Number)])
+        from description in GenerateDescription(apiGroup.Type)
+        from currentRevision in Gen.OneOfConst([.. revisions])
         select new ApiGroup
         {
             RootName = apiGroup.RootName,
             VersionSetName = apiGroup.VersionSetName,
-            Revisions = [.. revisions.Select(revision => revision with
-            {
-                IsCurrent = revision.Number == currentRevision
-            })],
+            Type = apiGroup.Type,
+            ServiceUri = apiGroup.ServiceUri,
+            CurrentRevision = currentRevision,
+            Revisions = [.. revisions],
             Description = description
         };
 
@@ -100,16 +197,23 @@ file sealed record ApiGroup
         var set = from api in apis
                   let rootName = ApiRevisionModule.GetRootName(api.Model.Name)
                   group api by rootName into apiGroup
+                  let rootModel = apiGroup.Single(model => ApiRevisionModule.IsRootName(model.Model.Name)).Model
+                  let revisions = apiGroup.Select(model => new ApiRevision
+                  {
+                      Number = model.Model.RevisionNumber,
+                      Specification = model.Model.Specification
+                  }).ToImmutableArray()
+                  let currentRevision = revisions.Single(revision => revision.Number == rootModel.RevisionNumber)
                   select (new ApiGroup
                   {
                       RootName = apiGroup.Key,
                       VersionSetName = apiGroup.Select(x => x.Model.VersionSetName).GetFirstOfUniform(),
-                      Revisions = [.. from revision in apiGroup
-                                      select new ApiRevision
-                                      {
-                                          IsCurrent = ApiRevisionModule.IsRootName(revision.Model.Name),
-                                          Number = revision.Model.RevisionNumber
-                                      } ],
+                      Type = apiGroup.Select(x => x.Model.Type).GetFirstOfUniform(),
+                      ServiceUri = apiGroup.Select(x => x.Model.ServiceUrl)
+                                           .GetFirstOfUniform()
+                                           .Map(url => new Uri(url)),
+                      CurrentRevision = currentRevision,
+                      Revisions = revisions,
                       Description = apiGroup.Select(x => x.Model.Description).GetFirstOfUniform()
                   }, apiGroup.Select(x => x.Predecessors).First());
 
@@ -134,7 +238,13 @@ internal sealed record ApiModel : IResourceWithReferenceTestModel<ApiModel>
         init => field = value < 1 ? throw new InvalidOperationException("Revision must be greater than 0.") : value;
     }
 
-    public required string Description { get; init; }
+    public required Option<string> Description { get; init; }
+
+    public required ApiType Type { get; init; }
+
+    public required Option<string> ServiceUrl { get; init; }
+
+    public required Option<string> Specification { get; init; }
 
     public required Option<ResourceName> VersionSetName { get; init; }
 
@@ -191,16 +301,24 @@ internal sealed record ApiModel : IResourceWithReferenceTestModel<ApiModel>
         {
             Properties = new ApiDto.ApiCreateOrUpdateProperties
             {
-                Description = Description,
+                Description = Description.IfNoneNull(),
                 IsCurrent = Name == ApiRevisionModule.GetRootName(Name),
                 DisplayName = ApiRevisionModule.GetRootName(Name).ToString(),
-                Protocols = ["http", "https"],
+                Protocols = Type switch
+                {
+                    ApiType.WebSocket => ["wss"],
+                    _ => ["http", "https"],
+                },
                 Path = $"{ApiRevisionModule.GetRootName(Name)}",
                 ApiRevision = RevisionNumber.ToString(),
                 ApiVersionSetId = predecessors.Pick(node => from name in VersionSetName
                                                             where node.Model.AssociatedResource is VersionSetResource
                                                             select node.ToResourceId())
-                                              .IfNoneNull()
+                                              .IfNoneNull(),
+                ServiceUrl = ServiceUrl.IfNoneNull(),
+                Type = Type is ApiType.WebSocket or ApiType.GraphQl
+                        ? Type.ToString()
+                        : null
             }
         }, AssociatedResource.SerializerOptions).IfErrorThrow();
 
@@ -217,19 +335,29 @@ internal sealed record ApiModel : IResourceWithReferenceTestModel<ApiModel>
         {
             RevisionNumber = overrideDto?.Properties?.ApiRevision ?? RevisionNumber.ToString(),
             Description = overrideDto?.Properties?.Description ?? Description,
-            VersionSetName = overrideDto?.Properties?.ApiVersionSetId?.Split('/')?.LastOrDefault() ?? VersionSetName.IfNoneNull()?.ToString()
+            VersionSetName = overrideDto?.Properties?.ApiVersionSetId?.Split('/')?.LastOrDefault() ?? VersionSetName.IfNoneNull()?.ToString(),
+            Type = overrideDto?.Properties?.Type ?? Type.ToString(),
+            ServiceUrl = Type is ApiType.GraphQl or ApiType.WebSocket
+                            ? overrideDto?.Properties?.ServiceUrl ?? ServiceUrl.IfNoneNull()
+                            : null
         };
 
         var right = new
         {
             RevisionNumber = jsonDto?.Properties?.ApiRevision,
             Description = jsonDto?.Properties?.Description,
-            VersionSetName = jsonDto?.Properties?.ApiVersionSetId?.Split('/')?.LastOrDefault()
+            VersionSetName = jsonDto?.Properties?.ApiVersionSetId?.Split('/')?.LastOrDefault(),
+            Type = jsonDto?.Properties?.Type ?? "http",
+            ServiceUrl = new string[] { "graphql", "websocket" }.Contains(jsonDto?.Properties?.Type, StringComparer.OrdinalIgnoreCase)
+                            ? jsonDto?.Properties?.ServiceUrl
+                            : null
         };
 
         return left.RevisionNumber.FuzzyEquals(right.RevisionNumber)
                && left.Description.FuzzyEquals(right.Description)
-               && left.VersionSetName.FuzzyEquals(right.VersionSetName);
+               && left.VersionSetName.FuzzyEquals(right.VersionSetName)
+               && left.Type.FuzzyEquals(right.Type)
+               && left.ServiceUrl.FuzzyEquals(right.ServiceUrl);
     }
 }
 

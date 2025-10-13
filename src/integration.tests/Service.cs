@@ -1,9 +1,7 @@
-﻿using Azure.Core.Pipeline;
+using Azure.Core.Pipeline;
 using common;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using Polly;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -18,33 +16,36 @@ namespace integration.tests;
 
 internal delegate ValueTask EmptyService(CancellationToken cancellationToken);
 internal delegate ValueTask PopulateService(ResourceModels models, CancellationToken cancellationToken);
-internal delegate ValueTask<bool> IsSkuSupported(IResource resource, ResourceAncestors ancestors, CancellationToken cancellationToken);
-internal delegate ValueTask<bool> ShouldSkipResource(IResource resource, ResourceName name, ResourceAncestors ancestors, CancellationToken cancellationToken);
+internal delegate ValueTask<bool> ShouldSkipResource(ResourceKey resourceKey, CancellationToken cancellationToken);
 
 internal static class ServiceModule
 {
     public static void ConfigureEmptyService(IHostApplicationBuilder builder)
     {
+        ResourceGraphModule.ConfigureResourceGraph(builder);
+        ResourceModule.ConfigureIsResourceSupportedInApim(builder);
+        ResourceModule.ConfigureListResourceNamesFromApim(builder);
+        ConfigureShouldSkipResource(builder);
+        AzureModule.ConfigureAzureEnvironment(builder);
         AzureModule.ConfigureHttpPipeline(builder);
         ManagementServiceModule.ConfigureServiceUri(builder);
-        ResourceGraphModule.ConfigureBuilder(builder);
-        ConfigureIsSkuSupported(builder);
-        ConfigureShouldSkipResource(builder);
 
-        builder.TryAddSingleton(GetEmptyService);
+        builder.TryAddSingleton(ResolveEmptyService);
     }
 
-    private static EmptyService GetEmptyService(IServiceProvider provider)
+    private static EmptyService ResolveEmptyService(IServiceProvider provider)
     {
-        var pipeline = provider.GetRequiredService<HttpPipeline>();
-        var serviceUri = provider.GetRequiredService<ServiceUri>();
         var graph = provider.GetRequiredService<ResourceGraph>();
-        var isSkuSupported = provider.GetRequiredService<IsSkuSupported>();
+        var isSkuSupported = provider.GetRequiredService<IsResourceSupportedInApim>();
+        var listNames = provider.GetRequiredService<ListResourceNamesFromApim>();
         var shouldSkipResource = provider.GetRequiredService<ShouldSkipResource>();
+        var serviceUri = provider.GetRequiredService<ServiceUri>();
+        var azureEnvironment = provider.GetRequiredService<AzureEnvironment>();
+        var pipeline = provider.GetRequiredService<HttpPipeline>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
 
-        var rootResources = graph.GetTraversalRootResources();
-        var deleteTimeout = new ResiliencePipelineBuilder().AddTimeout(TimeSpan.FromSeconds(90)).Build();
+        var rootResources = graph.ListTraversalRootResources();
+        var parents = ParentChain.Empty;
 
         return async cancellationToken =>
         {
@@ -60,16 +61,14 @@ internal static class ServiceModule
         async ValueTask emptyResource(IResource resource, ConcurrentDictionary<IResource, Lazy<Task>> tasks, CancellationToken cancellationToken) =>
             await tasks.GetOrAdd(resource, _ => new(async () =>
             {
-                var ancestors = ResourceAncestors.Empty;
-
                 // Skip unsupported resources
-                if (await isSkuSupported(resource, ancestors, cancellationToken) is false)
+                if (await isSkuSupported(resource, cancellationToken) is false)
                 {
                     return;
                 }
 
                 // Delete dependents
-                await getDependents(resource)
+                await getDependentRootResources(resource)
                           .IterTaskParallel(async dependent => await emptyResource(dependent, tasks, cancellationToken),
                                             maxDegreeOfParallelism: Option.None,
                                             cancellationToken);
@@ -78,31 +77,28 @@ internal static class ServiceModule
                 {
                     case ApiResource:
                         // Delete all non-current revisions first, then the current revision
-                        var nonCurrentRevisions = new List<(IResource, ResourceName, ResourceAncestors)>();
-                        var currentRevisions = new List<(IResource, ResourceName, ResourceAncestors)>();
-
-                        await resource.ListNames(ancestors, serviceUri, pipeline, cancellationToken)
-                                      .IterTask(async name =>
-                                      {
-                                          await ValueTask.CompletedTask;
-
-                                          if (ApiRevisionModule.IsRootName(name))
-                                          {
-                                              currentRevisions.Add((resource, name, ancestors));
-                                          }
-                                          else
-                                          {
-                                              nonCurrentRevisions.Add((resource, name, ancestors));
-                                          }
-                                      }, cancellationToken);
+                        var (currentRevisions, nonCurrentRevisions) =
+                            await listNames(resource, parents, cancellationToken)
+                                    .Select(name => new ResourceKey
+                                    {
+                                        Parents = parents,
+                                        Name = name,
+                                        Resource = resource
+                                    })
+                                    .Partition(resourceKey => ApiRevisionModule.IsRootName(resourceKey.Name), cancellationToken);
 
                         await bulkDelete(nonCurrentRevisions.ToAsyncEnumerable(), cancellationToken);
                         await bulkDelete(currentRevisions.ToAsyncEnumerable(), cancellationToken);
 
                         break;
                     default:
-                        var resources = resource.ListNames(ancestors, serviceUri, pipeline, cancellationToken)
-                                                .Select(name => (resource, name, ancestors));
+                        var resources = listNames(resource, parents, cancellationToken)
+                                            .Select(name => new ResourceKey
+                                            {
+                                                Parents = parents,
+                                                Name = name,
+                                                Resource = resource
+                                            });
 
                         await bulkDelete(resources, cancellationToken);
 
@@ -110,47 +106,43 @@ internal static class ServiceModule
                 }
             })).Value;
 
-        // Finds all root resources that must be deleted before the given resource.
-        IEnumerable<IResource> getDependents(IResource resource)
+        IEnumerable<IResource> getDependentRootResources(IResource resource)
         {
-            var dependents = new HashSet<IResource>();
+            var successors = graph.ListSortingSuccessors(resource);
+            var successorParents = from successor in successors
+                                   select getParentRootResource(successor);
 
-            graph.TopologicallySortedResources
-                 .Where(potentialReferencer => potentialReferencer is IResourceWithReference resourceWithReference
-                                                && (resourceWithReference.MandatoryReferencedResourceDtoProperties.ContainsKey(resource)
-                                                    || resourceWithReference.OptionalReferencedResourceDtoProperties.ContainsKey(resource)))
-                 .Iter(addTraversalChain);
+            var successorDependentRoots = from successor in successors
+                                          from dependentRootResource in getDependentRootResources(successor)
+                                          select dependentRootResource;
 
-            return dependents.Where(rootResources.Contains);
-
-            void addTraversalChain(IResource resource)
-            {
-                dependents.Add(resource);
-
-                resource.GetTraversalPredecessor()
-                        .Iter(addTraversalChain);
-            }
+            return from root in successorParents.Union(successorDependentRoots)
+                   where root != resource
+                   where rootResources.Contains(root)
+                   select root;
         }
 
-        async ValueTask bulkDelete(IAsyncEnumerable<(IResource resource, ResourceName name, ResourceAncestors ancestors)> resources, CancellationToken cancellationToken) =>
-            await resources.Where(async (x, cancellationToken) => await shouldSkipResource(x.resource, x.name, x.ancestors, cancellationToken) is false)
+        static IResource getParentRootResource(IResource resource) =>
+            resource.GetTraversalPredecessorHierarchy() switch
+            {
+                [var root, ..] => root,
+                [] => resource
+            };
+
+        async ValueTask bulkDelete(IAsyncEnumerable<ResourceKey> resources, CancellationToken cancellationToken) =>
+            await resources.Where(async (resourceKey, cancellationToken) => await shouldSkipResource(resourceKey, cancellationToken) is false)
                            .Chunk(50)
                            .IterTask(async chunk =>
                            {
-                               var uri = new Uri("https://management.azure.com/batch?api-version=2022-12-01");
+                               var uri = new Uri($"{azureEnvironment.ManagementEndpoint}/batch?api-version=2022-12-01");
 
                                var content = new JsonObject
                                {
-                                   ["requests"] = chunk.Select(x =>
+                                   ["requests"] = chunk.Select(x => new JsonObject()
                                    {
-                                       var (resource, name, ancestors) = x;
-
-                                       return new JsonObject()
-                                       {
-                                           ["name"] = Guid.NewGuid().ToString(),
-                                           ["httpMethod"] = "DELETE",
-                                           ["url"] = resource.GetUri(name, ancestors, serviceUri).ToString()
-                                       };
+                                       ["name"] = Guid.NewGuid().ToString(),
+                                       ["httpMethod"] = "DELETE",
+                                       ["url"] = x.Resource.GetUri(x.Name, x.Parents, serviceUri).ToString()
                                    }).ToJsonArray()
                                };
 
@@ -160,20 +152,19 @@ internal static class ServiceModule
 
     public static void ConfigurePopulateService(IHostApplicationBuilder builder)
     {
-        AzureModule.ConfigureHttpPipeline(builder);
-        ManagementServiceModule.ConfigureServiceUri(builder);
-        ConfigureIsSkuSupported(builder);
+        ResourceModule.ConfigureIsResourceSupportedInApim(builder);
+        ResourceModule.ConfigurePutResourceInApim(builder);
+        ResourceModule.ConfigurePutApiSpecificationInApim(builder);
 
-        builder.TryAddSingleton(GetPopulateService);
+        builder.TryAddSingleton(ResolvePopulateService);
     }
 
-    private static PopulateService GetPopulateService(IServiceProvider provider)
+    private static PopulateService ResolvePopulateService(IServiceProvider provider)
     {
-        var pipeline = provider.GetRequiredService<HttpPipeline>();
-        var serviceUri = provider.GetRequiredService<ServiceUri>();
-        var isSkuSupported = provider.GetRequiredService<IsSkuSupported>();
+        var isSkuSupported = provider.GetRequiredService<IsResourceSupportedInApim>();
+        var putInApim = provider.GetRequiredService<PutResourceInApim>();
+        var putApiSpecification = provider.GetRequiredService<PutApiSpecificationInApim>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
-        var logger = provider.GetRequiredService<ILogger>();
 
         return async (models, cancellationToken) =>
         {
@@ -198,8 +189,8 @@ internal static class ServiceModule
                 }
 
                 // Skip unsupported resources
-                var ancestors = node.GetResourceAncestors();
-                if (await isSkuSupported(resource, ancestors, cancellationToken) is false)
+                var parents = node.GetResourceParentChain();
+                if (await isSkuSupported(resource, cancellationToken) is false)
                 {
                     return;
                 }
@@ -210,58 +201,100 @@ internal static class ServiceModule
                                             maxDegreeOfParallelism: Option.None,
                                             cancellationToken);
 
-                // If this is not the current API revision, put the current API revision first
-                if (model is ApiModel apiModel && ApiRevisionModule.IsRootName(apiModel.Name) is false)
-                {
-                    var currentRevisionNode = resourceModels.Find(ApiResource.Instance)
-                                                            .IfNone(() => ModelNodeSet.Empty)
-                                                            .Single(node => node.Model.Name == ApiRevisionModule.GetRootName(apiModel.Name));
-
-                    await putModel(currentRevisionNode, resourceModels, tasks, cancellationToken);
-                }
-
-                // Put model
                 var name = model.Name;
-                var dto = model.SerializeDto(node.Predecessors);
+                switch (model)
+                {
+                    case ApiModel apiModel:
+                        {
+                            // If this is not the current API revision, put the current API revision first
+                            if (ApiRevisionModule.IsRootName(name) is false)
+                            {
+                                var currentRevisionNode = resourceModels.Find(ApiResource.Instance)
+                                                                        .IfNone(() => ModelNodeSet.Empty)
+                                                                        .Single(node => node.Model.Name == ApiRevisionModule.GetRootName(name));
 
-                logger.LogInformation("Putting {Resource} '{Name}'{Ancestors}.", resource.SingularName, name, ancestors.ToLogString());
-                await resource.PutDto(name, dto, ancestors, serviceUri, pipeline, cancellationToken);
-            })).Value;
-    }
+                                await putModel(currentRevisionNode, resourceModels, tasks, cancellationToken);
+                            }
 
-    public static void ConfigureIsSkuSupported(IHostApplicationBuilder builder)
-    {
-        AzureModule.ConfigureHttpPipeline(builder);
-        ManagementServiceModule.ConfigureServiceUri(builder);
-        builder.TryAddSingleton(GetIsSkuSupported);
-    }
+                            // Put model
+                            var dto = model.SerializeDto(node.Predecessors);
+                            await putInApim(resource, name, dto, parents, cancellationToken);
 
-    private static IsSkuSupported GetIsSkuSupported(IServiceProvider provider)
-    {
-        var pipeline = provider.GetRequiredService<HttpPipeline>();
-        var serviceUri = provider.GetRequiredService<ServiceUri>();
+                            // Put API specification
+                            var option = from specification in apiModel.Type switch
+                            {
+                                ApiType.Http => Option.Some<ApiSpecification>(new ApiSpecification.OpenApi
+                                {
+                                    Format = OpenApiFormat.Yaml.Instance,
+                                    Version = OpenApiVersion.V3.Instance,
+                                }),
+                                ApiType.Soap => ApiSpecification.Wsdl.Instance,
+                                ApiType.GraphQl => ApiSpecification.GraphQl.Instance,
+                                _ => Option.None
+                            }
+                                         from contentsString in apiModel.Specification
+                                         let contents = BinaryData.FromString(contentsString)
+                                         select (specification, contents);
 
-        return async (resource, ancestors, cancellationToken) =>
-            await resource.IsSkuSupported(ancestors, serviceUri, pipeline, cancellationToken);
+                            await option.IterTask(async tuple => await putApiSpecification(name, tuple.specification, tuple.contents, cancellationToken));
+
+                            break;
+                        }
+                    default:
+                        {
+                            var dto = model.SerializeDto(node.Predecessors);
+                            await putInApim(resource, name, dto, parents, cancellationToken);
+                            break;
+                        }
+                }
+            })).Value.ConfigureAwait(true);
     }
 
     public static void ConfigureShouldSkipResource(IHostApplicationBuilder builder)
     {
-        ConfigureIsSkuSupported(builder);
-        builder.TryAddSingleton(GetShouldSkipResource);
+        ResourceModule.ConfigureIsResourceSupportedInApim(builder);
+
+        builder.TryAddSingleton(ResolveShouldSkipResource);
     }
 
-    private static ShouldSkipResource GetShouldSkipResource(IServiceProvider provider)
+    private static ShouldSkipResource ResolveShouldSkipResource(IServiceProvider provider)
     {
-        var isSkuSupported = provider.GetRequiredService<IsSkuSupported>();
+        var isSkuSupported = provider.GetRequiredService<IsResourceSupportedInApim>();
 
-        return async (resource, name, ancestors, cancellationToken) =>
+        return async (resourceKey, cancellationToken) =>
+        {
+            var (resource, name, parents) = (resourceKey.Resource, resourceKey.Name, resourceKey.Parents);
+
             // Skip unsupported resources
-            await isSkuSupported(resource, ancestors, cancellationToken) is false
+            return await isSkuSupported(resource, cancellationToken) is false
             // Skip system groups
             || (resource is GroupResource
                 && (name == GroupResource.Administrators || name == GroupResource.Developers || name == GroupResource.Guests))
             // Skip master subscription
             || (resource is SubscriptionResource && name == SubscriptionResource.Master);
+        };
+    }
+}
+
+file static class Extensions
+{
+    public static async ValueTask<(ImmutableArray<T> Matches, ImmutableArray<T> NonMatches)> Partition<T>(this IAsyncEnumerable<T> source, Func<T, bool> predicate, CancellationToken cancellationToken)
+    {
+        var matches = new List<T>();
+        var nonMatches = new List<T>();
+
+        await foreach (var item in source.WithCancellation(cancellationToken))
+        {
+            if (predicate(item))
+            {
+                matches.Add(item);
+            }
+            else
+            {
+                nonMatches.Add(item);
+            }
+        }
+
+        return ([.. matches], [.. nonMatches]);
     }
 }

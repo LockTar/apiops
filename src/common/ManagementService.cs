@@ -81,10 +81,10 @@ public static class ManagementServiceModule
         AzureModule.ConfigureServiceProviderUri(builder);
         ConfigureServiceName(builder);
 
-        builder.TryAddSingleton(GetServiceUri);
+        builder.TryAddSingleton(ResolveServiceUri);
     }
 
-    private static ServiceUri GetServiceUri(IServiceProvider provider)
+    private static ServiceUri ResolveServiceUri(IServiceProvider provider)
     {
         var serviceProviderUri = provider.GetRequiredService<ServiceProviderUri>();
         var serviceName = provider.GetRequiredService<ServiceName>();
@@ -97,9 +97,9 @@ public static class ManagementServiceModule
     }
 
     public static void ConfigureServiceDirectory(IHostApplicationBuilder builder) =>
-        builder.TryAddSingleton(GetServiceDirectory);
+        builder.TryAddSingleton(ResolveServiceDirectory);
 
-    private static ServiceDirectory GetServiceDirectory(IServiceProvider provider)
+    private static ServiceDirectory ResolveServiceDirectory(IServiceProvider provider)
     {
         var configuration = provider.GetRequiredService<IConfiguration>();
 
@@ -109,9 +109,9 @@ public static class ManagementServiceModule
     }
 
     public static void ConfigureServiceName(IHostApplicationBuilder builder) =>
-        builder.TryAddSingleton(GetServiceName);
+        builder.TryAddSingleton(ResolveServiceName);
 
-    private static ServiceName GetServiceName(IServiceProvider provider)
+    private static ServiceName ResolveServiceName(IServiceProvider provider)
     {
         var configuration = provider.GetRequiredService<IConfiguration>();
 

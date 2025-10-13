@@ -1,7 +1,10 @@
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Polly;
 using Polly.Retry;
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.IO;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -12,6 +15,15 @@ namespace common;
 
 public delegate ValueTask<Option<BinaryData>> ReadFile(FileInfo file, CancellationToken cancellationToken);
 public delegate Option<IEnumerable<DirectoryInfo>> GetSubDirectories(DirectoryInfo directory);
+public delegate FileOperations GetLocalFileOperations();
+
+public sealed record FileOperations
+{
+    public required ReadFile ReadFile { get; init; }
+    public required GetSubDirectories GetSubDirectories { get; init; }
+    public required Func<ImmutableHashSet<FileInfo>> EnumerateServiceDirectoryFiles { get; init; }
+}
+
 
 public static class DirectoryInfoModule
 {
@@ -144,4 +156,28 @@ file static class Retry
             }
         })
         .Build();
+}
+
+public static class FileSystemModule
+{
+    public static void ConfigureGetLocalFileOperations(IHostApplicationBuilder builder)
+    {
+        ManagementServiceModule.ConfigureServiceDirectory(builder);
+
+        builder.TryAddSingleton(ResolveGetLocalFileOperations);
+    }
+
+    private static GetLocalFileOperations ResolveGetLocalFileOperations(IServiceProvider provider)
+    {
+        var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
+
+        return () => new FileOperations
+        {
+            ReadFile = async (file, cancellationToken) => await file.ReadAsBinaryData(cancellationToken),
+            GetSubDirectories = directory => Option.Some(directory.EnumerateDirectories()),
+            EnumerateServiceDirectoryFiles = () => serviceDirectory.ToDirectoryInfo()
+                                                                    .EnumerateFiles("*", SearchOption.AllDirectories)
+                                                                    .ToImmutableHashSet(FileInfoModule.Comparer)
+        };
+    }
 }

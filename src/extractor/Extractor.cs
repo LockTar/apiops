@@ -1,4 +1,3 @@
-using Azure.Core.Pipeline;
 using common;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -7,7 +6,6 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,28 +13,29 @@ using System.Threading.Tasks;
 namespace extractor;
 
 internal delegate ValueTask RunExtractor(CancellationToken cancellationToken);
-internal delegate IAsyncEnumerable<(ResourceName Name, Option<JsonObject> Dto)> ListResources(IResource resource, ResourceAncestors ancestors, CancellationToken cancellationToken);
-internal delegate ValueTask<bool> ShouldExtract(IResource resource, ResourceName name, Option<JsonObject> dtoOption, ResourceAncestors ancestors, CancellationToken cancellationToken);
-internal delegate ValueTask WriteResource(IResource resource, ResourceName name, Option<JsonObject> dtoOption, ResourceAncestors ancestors, CancellationToken cancellationToken);
-internal delegate ValueTask WriteInformationFile(IResourceWithInformationFile resource, ResourceName name, JsonObject dto, ResourceAncestors ancestors, CancellationToken cancellationToken);
-internal delegate ValueTask WritePolicyFile(IPolicyResource resource, ResourceName name, JsonObject dto, ResourceAncestors ancestors, CancellationToken cancellationToken);
+internal delegate ValueTask<bool> ShouldExtract(ResourceKey resourceKey, CancellationToken cancellationToken);
+internal delegate ValueTask WriteResource(ResourceKey resourceKey, Option<JsonObject> dtoOption, CancellationToken cancellationToken);
 
 internal static class ExtractorModule
 {
     public static void ConfigureRunExtractor(IHostApplicationBuilder builder)
     {
-        ResourceGraphModule.ConfigureBuilder(builder);
-        ConfigureListResources(builder);
+        ResourceGraphModule.ConfigureResourceGraph(builder);
+        ResourceModule.ConfigureIsResourceSupportedInApim(builder);
+        ResourceModule.ConfigureListResourceNamesFromApim(builder);
+        ResourceModule.ConfigureListResourceDtosFromApim(builder);
         ConfigureShouldExtract(builder);
         ConfigureWriteResource(builder);
 
-        builder.TryAddSingleton(GetRunExtractor);
+        builder.TryAddSingleton(ResolveRunExtractor);
     }
 
-    private static RunExtractor GetRunExtractor(IServiceProvider provider)
+    private static RunExtractor ResolveRunExtractor(IServiceProvider provider)
     {
         var graph = provider.GetRequiredService<ResourceGraph>();
-        var listResources = provider.GetRequiredService<ListResources>();
+        var isSkuSupported = provider.GetRequiredService<IsResourceSupportedInApim>();
+        var listResourceNames = provider.GetRequiredService<ListResourceNamesFromApim>();
+        var listResourceDtos = provider.GetRequiredService<ListResourceDtosFromApim>();
         var shouldExtract = provider.GetRequiredService<ShouldExtract>();
         var writeResource = provider.GetRequiredService<WriteResource>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
@@ -48,99 +47,59 @@ internal static class ExtractorModule
 
             logger.LogInformation("Running extractor...");
 
-            await graph.GetTraversalRootResources()
-                       .IterTaskParallel(async resource => await processResource(resource, ResourceAncestors.Empty, cancellationToken),
+            await graph.ListTraversalRootResources()
+                       .IterTaskParallel(async resource => await processResource(resource, ParentChain.Empty, cancellationToken),
                                          maxDegreeOfParallelism: Option.None,
                                          cancellationToken);
 
             logger.LogInformation("Extractor completed successfully.");
         };
 
-        async ValueTask processResource(IResource resource, ResourceAncestors ancestors, CancellationToken cancellationToken) =>
-            await listResources(resource, ancestors, cancellationToken)
-                    .IterTaskParallel(async x => await extractResource(resource, x.Name, x.Dto, ancestors, cancellationToken),
+        async ValueTask processResource(IResource resource, ParentChain parents, CancellationToken cancellationToken)
+        {
+            if (await isSkuSupported(resource, cancellationToken) is false)
+            {
+                logger.LogWarning("Skipping {Resource} as they are not supported in the APIM SKU.", resource.PluralName);
+                return;
+            }
+
+            await listNamesAndDtos(resource, parents, cancellationToken)
+                    .IterTaskParallel(async x => await extractResource(resource, x.Name, x.Dto, parents, cancellationToken),
                                       maxDegreeOfParallelism: Option.None,
                                       cancellationToken);
+        }
 
-        async ValueTask extractResource(IResource resource, ResourceName name, Option<JsonObject> dtoOption, ResourceAncestors ancestors, CancellationToken cancellationToken)
+        IAsyncEnumerable<(ResourceName Name, Option<JsonObject> Dto)> listNamesAndDtos(IResource resource, ParentChain parents, CancellationToken cancellationToken) =>
+            resource switch
+            {
+                IResourceWithDto resourceWithDto =>
+                    from x in listResourceDtos(resourceWithDto, parents, cancellationToken)
+                    select (x.Name, Option.Some(x.Dto)),
+                _ => from name in listResourceNames(resource, parents, cancellationToken)
+                     select (name, Option<JsonObject>.None())
+            };
+
+        async ValueTask extractResource(IResource resource, ResourceName name, Option<JsonObject> dtoOption, ParentChain parents, CancellationToken cancellationToken)
         {
-            // Skip the resource if it should not be extracted.
-            var extract = await shouldExtract(resource, name, dtoOption, ancestors, cancellationToken);
+            var resourceKey = new ResourceKey { Resource = resource, Name = name, Parents = parents };
 
-            if (extract is false)
+            // Skip the resource if it should not be extracted.
+            if (await shouldExtract(resourceKey, cancellationToken) is false)
             {
                 return;
             }
 
-            // Extract the resource
-            await writeResource(resource, name, dtoOption, ancestors, cancellationToken);
+            // Write the resource's artifacts
+            await writeResource(resourceKey, dtoOption, cancellationToken);
 
             // Process the resource's successors
-            var successorAncestors = ancestors.Append(resource, name);
-
-            await graph.GetTraversalSuccessors(resource)
-                       .IterTaskParallel(async successor => await processResource(successor, successorAncestors, cancellationToken),
+            var successorParents = parents.Append(resource, name);
+            await graph.ListTraversalSuccessors(resource)
+                       // Only extract releases under the current API
+                       .Where(successor => resource is not ApiResource || successor is not ApiReleaseResource || ApiRevisionModule.IsRootName(name))
+                       .IterTaskParallel(async successor => await processResource(successor, successorParents, cancellationToken),
                                          maxDegreeOfParallelism: Option.None,
                                          cancellationToken);
-        }
-    }
-
-    private static void ConfigureListResources(IHostApplicationBuilder builder)
-    {
-        ManagementServiceModule.ConfigureServiceUri(builder);
-        AzureModule.ConfigureHttpPipeline(builder);
-
-        builder.TryAddSingleton(GetListResources);
-    }
-
-    private static ListResources GetListResources(IServiceProvider provider)
-    {
-        var serviceUri = provider.GetRequiredService<ServiceUri>();
-        var pipeline = provider.GetRequiredService<HttpPipeline>();
-        var logger = provider.GetRequiredService<ILogger>();
-        var activitySource = provider.GetRequiredService<ActivitySource>();
-
-        return (resource, ancestors, cancellationToken) =>
-        {
-            using var _ = activitySource.StartActivity("list.resources")
-                                       ?.SetTag("resource", resource.SingularName)
-                                       ?.TagAncestors(ancestors);
-
-            return list(resource, ancestors, cancellationToken);
-        };
-
-        async IAsyncEnumerable<(ResourceName, Option<JsonObject>)> list(IResource resource, ResourceAncestors ancestors, [EnumeratorCancellation] CancellationToken cancellationToken)
-        {
-            // Skip unsupported SKUs
-            if (await resource.IsSkuSupported(ancestors, serviceUri, pipeline, cancellationToken) is false)
-            {
-                yield break;
-            }
-
-            switch (resource)
-            {
-                // For resources with DTOs, list names and DTOs
-                case IResourceWithDto resourceWithDto:
-                    var items = resourceWithDto.ListNamesAndDtos(ancestors, serviceUri, pipeline, cancellationToken);
-
-                    await foreach (var (name, dto) in items.WithCancellation(cancellationToken))
-                    {
-                        yield return (name, Option.Some(dto));
-                    }
-
-                    break;
-
-                // Otherwise, list names and no DTOs
-                default:
-                    var names = resource.ListNames(ancestors, serviceUri, pipeline, cancellationToken);
-
-                    await foreach (var name in names.WithCancellation(cancellationToken))
-                    {
-                        yield return (name, Option.None);
-                    }
-
-                    break;
-            }
         }
     }
 
@@ -148,31 +107,33 @@ internal static class ExtractorModule
     {
         ConfigurationModule.ConfigureResourceIsInConfiguration(builder);
 
-        builder.TryAddSingleton(GetShouldExtract);
+        builder.TryAddSingleton(ResolveShouldExtract);
     }
 
-    private static ShouldExtract GetShouldExtract(IServiceProvider provider)
+    private static ShouldExtract ResolveShouldExtract(IServiceProvider provider)
     {
         var resourceIsInConfiguration = provider.GetRequiredService<ResourceIsInConfiguration>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
         var logger = provider.GetRequiredService<ILogger>();
 
-        return async (resource, name, dtoOption, ancestors, cancellationToken) =>
+        return async (resourceKey, cancellationToken) =>
         {
             using var activity = activitySource.StartActivity("should.extract")
-                                              ?.SetTag("resource", resource.SingularName)
-                                              ?.SetTag("name", name.ToString())
-                                              ?.TagAncestors(ancestors);
+                                              ?.SetTag("resourceKey", resourceKey);
 
-            var extract = await shouldExtract(resource, name, ancestors, cancellationToken);
+            var extract = await shouldExtract(resourceKey, cancellationToken);
 
             activity?.SetTag("extract", extract);
 
             return extract;
         };
 
-        async ValueTask<bool> shouldExtract(IResource resource, ResourceName name, ResourceAncestors ancestors, CancellationToken cancellationToken)
+        async ValueTask<bool> shouldExtract(ResourceKey resourceKey, CancellationToken cancellationToken)
         {
+            var resource = resourceKey.Resource;
+            var name = resourceKey.Name;
+            var parents = resourceKey.Parents;
+
             // Never extract the `master` subscription
             if (resource is SubscriptionResource && name == SubscriptionResource.Master)
             {
@@ -189,10 +150,11 @@ internal static class ExtractorModule
             // Check from configuration. If no configuration was defined for the resource type, extract all.
             else
             {
-                var option = await resourceIsInConfiguration(resource, name, ancestors, cancellationToken);
+                var option = await resourceIsInConfiguration(resourceKey, cancellationToken);
 
+                // Log a warning if the resource should be skipped.
                 option.Where(result => result is false)
-                      .Iter(_ => logger.LogWarning("Skipping {Resource} '{Name}'{Ancestors} as it is not in configuration.", resource.SingularName, name, ancestors.ToLogString()));
+                      .Iter(_ => logger.LogWarning("Skipping {ResourceKey} as it is not in configuration...", resourceKey));
 
                 return option.IfNone(() => true);
             }
@@ -201,85 +163,58 @@ internal static class ExtractorModule
 
     private static void ConfigureWriteResource(IHostApplicationBuilder builder)
     {
-        ConfigureWriteInformationFile(builder);
-        ConfigureWritePolicyFile(builder);
+        ResourceModule.ConfigureWriteInformationFile(builder);
+        ResourceModule.ConfigureWritePolicyFile(builder);
+        ResourceModule.ConfigureGetApiSpecificationFromApim(builder);
+        ResourceModule.ConfigureWriteApiSpecificationFile(builder);
 
-        builder.TryAddSingleton(GetWriteResource);
+        builder.TryAddSingleton(ResolveWriteResource);
     }
 
-    private static WriteResource GetWriteResource(IServiceProvider provider)
+    private static WriteResource ResolveWriteResource(IServiceProvider provider)
     {
         var writeInformationFile = provider.GetRequiredService<WriteInformationFile>();
         var writePolicyFile = provider.GetRequiredService<WritePolicyFile>();
+        var getApiSpecification = provider.GetRequiredService<GetApiSpecificationFromApim>();
+        var writeApiSpecificationFile = provider.GetRequiredService<WriteApiSpecificationFile>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
+        var logger = provider.GetRequiredService<ILogger>();
 
-        return async (resource, name, dtoOption, ancestors, cancellationToken) =>
+        return async (resourceKey, dtoOption, cancellationToken) =>
         {
             using var _ = activitySource.StartActivity("write.resource")
-                                       ?.SetTag("resource", resource.SingularName)
-                                       ?.SetTag("name", name.ToString())
-                                       ?.TagAncestors(ancestors);
+                                       ?.SetTag("resourceKey", resourceKey);
 
-            if (resource is IResourceWithInformationFile resourceWithInformationFile)
+            await dtoOption.IterTask(async dto =>
             {
-                await dtoOption.IterTask(async dto => await writeInformationFile(resourceWithInformationFile, name, dto, ancestors, cancellationToken));
-            }
+                var resource = resourceKey.Resource;
+                var name = resourceKey.Name;
+                var parents = resourceKey.Parents;
 
-            if (resource is IPolicyResource policyResource)
-            {
-                await dtoOption.IterTask(async dto => await writePolicyFile(policyResource, name, dto, ancestors, cancellationToken));
-            }
-        };
-    }
+                if (resource is IResourceWithInformationFile resourceWithInformationFile)
+                {
+                    logger.LogInformation("Writing information file for {ResourceKey}...", resourceKey);
+                    await writeInformationFile(resourceWithInformationFile, name, dto, parents, cancellationToken);
+                }
 
-    private static void ConfigureWriteInformationFile(IHostApplicationBuilder builder)
-    {
-        ManagementServiceModule.ConfigureServiceDirectory(builder);
+                if (resource is IPolicyResource policyResource)
+                {
+                    logger.LogInformation("Writing policy file for {ResourceKey}...", resourceKey);
+                    await writePolicyFile(policyResource, name, dto, parents, cancellationToken);
+                }
 
-        builder.TryAddSingleton(GetWriteInformationFile);
-    }
+                if (resource is ApiResource)
+                {
+                    var option = await getApiSpecification(name, dto, cancellationToken);
+                    await option.IterTask(async tuple =>
+                    {
+                        var (specification, contents) = tuple;
 
-    private static WriteInformationFile GetWriteInformationFile(IServiceProvider provider)
-    {
-        var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
-        var activitySource = provider.GetRequiredService<ActivitySource>();
-        var logger = provider.GetRequiredService<ILogger>();
-
-        return async (resource, name, dto, ancestors, cancellationToken) =>
-        {
-            using var activity = activitySource.StartActivity("write.information.file")
-                                              ?.SetTag("resource", resource.SingularName)
-                                              ?.SetTag("name", name.ToString())
-                                              ?.TagAncestors(ancestors);
-
-            logger.LogInformation("Writing information file for {Resource} '{Name}'{Ancestors}...", resource.SingularName, name, ancestors.ToLogString());
-
-            await resource.WriteInformationFile(name, dto, ancestors, serviceDirectory, cancellationToken);
-        };
-    }
-
-    private static void ConfigureWritePolicyFile(IHostApplicationBuilder builder)
-    {
-        ManagementServiceModule.ConfigureServiceDirectory(builder);
-
-        builder.TryAddSingleton(GetWritePolicyFile);
-    }
-
-    private static WritePolicyFile GetWritePolicyFile(IServiceProvider provider)
-    {
-        var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
-        var activitySource = provider.GetRequiredService<ActivitySource>();
-        var logger = provider.GetRequiredService<ILogger>();
-
-        return async (resource, name, dto, ancestors, cancellationToken) =>
-        {
-            using var activity = activitySource.StartActivity("write.policy.file")
-                                              ?.SetTag("name", name.ToString())
-                                              ?.TagAncestors(ancestors);
-
-            logger.LogInformation("Writing policy file for {Resource} '{Name}'{Ancestors}...", resource.SingularName, name, ancestors.ToLogString());
-
-            await resource.WritePolicyFile(name, dto, ancestors, serviceDirectory, cancellationToken);
+                        logger.LogInformation("Writing specification file for {ResourceKey}...", resourceKey);
+                        await writeApiSpecificationFile(name, specification, contents, cancellationToken);
+                    });
+                }
+            });
         };
     }
 }

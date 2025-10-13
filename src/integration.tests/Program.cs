@@ -41,7 +41,7 @@ internal static class Program
     private static void ConfigureLogging(IHostApplicationBuilder builder)
     {
         // Azure identity logs are too verbose by default, only log if there's an issue
-        // builder.Logging.AddFilter("Azure.Identity", LogLevel.Warning);
+        builder.Logging.AddFilter("Azure.Identity", LogLevel.Warning);
 
         builder.TryAddSingleton(provider => provider.GetRequiredService<ILoggerFactory>()
                                                     .CreateLogger("integration.tests"));

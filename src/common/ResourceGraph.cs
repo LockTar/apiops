@@ -89,17 +89,17 @@ public sealed record ResourceGraph
         return [.. sorted];
     }
 
-    public ImmutableHashSet<IResource> GetTraversalRootResources() =>
+    public ImmutableHashSet<IResource> ListTraversalRootResources() =>
         [.. TopologicallySortedResources
                 .Where(resource => resource.GetTraversalPredecessor().IsNone)];
 
-    public ImmutableHashSet<IResource> GetTraversalSuccessors(IResource resource) =>
+    public ImmutableHashSet<IResource> ListTraversalSuccessors(IResource resource) =>
         [.. TopologicallySortedResources
                 .Choose(potentialSuccessor => from predecessor in potentialSuccessor.GetTraversalPredecessor()
                                               where predecessor == resource
                                               select potentialSuccessor)];
 
-    public ImmutableHashSet<IResource> GetSortingSuccessors(IResource resource) =>
+    public ImmutableHashSet<IResource> ListSortingSuccessors(IResource resource) =>
         [.. from potentialSuccessor in TopologicallySortedResources
             where potentialSuccessor.GetSortingPredecessors().Contains(resource)
             select potentialSuccessor];
@@ -107,10 +107,10 @@ public sealed record ResourceGraph
 
 public static class ResourceGraphModule
 {
-    public static void ConfigureBuilder(IHostApplicationBuilder builder) =>
-        builder.TryAddSingleton(GetResourceGraph);
+    public static void ConfigureResourceGraph(IHostApplicationBuilder builder) =>
+        builder.TryAddSingleton(ResolveResourceGraph);
 
-    private static ResourceGraph GetResourceGraph(IServiceProvider provider)
+    private static ResourceGraph ResolveResourceGraph(IServiceProvider provider)
     {
         var cancellationToken = CancellationToken.None;
 
@@ -124,6 +124,7 @@ public static class ResourceGraphModule
                                    TagApiResource.Instance,
                                    TagProductResource.Instance,
                                    ApiResource.Instance,
+                                   ApiReleaseResource.Instance,
                                    ApiPolicyResource.Instance,
                                    ApiDiagnosticResource.Instance,
                                    BackendResource.Instance,

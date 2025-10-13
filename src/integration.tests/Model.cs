@@ -1,4 +1,4 @@
-﻿using common;
+using common;
 using CsCheck;
 using System;
 using System.Collections;
@@ -128,10 +128,10 @@ internal interface IPolicyResourceTestModel<T> : IDtoTestModel<T> where T : IPol
 
     bool IDtoTestModel.MatchesDto(JsonObject json, Option<JsonObject> overrideJson)
     {
-        var jsonDto = JsonNodeModule.To<ApiDto>(json, T.AssociatedResource.SerializerOptions)
+        var jsonDto = JsonNodeModule.To<PolicyDto>(json, T.AssociatedResource.SerializerOptions)
                                     .IfErrorNull();
 
-        var overrideDto = overrideJson.Bind(json => JsonNodeModule.To<ApiDto>(json, T.AssociatedResource.SerializerOptions)
+        var overrideDto = overrideJson.Bind(json => JsonNodeModule.To<PolicyDto>(json, T.AssociatedResource.SerializerOptions)
                                                                   .ToOption())
                                       .IfNoneNull();
 
@@ -200,34 +200,34 @@ internal sealed record ModelNode
 
 internal static class ModelNodeModule
 {
-    public static ResourceAncestors GetResourceAncestors(this ModelNode node)
+    public static ParentChain GetResourceParentChain(this ModelNode node)
     {
-        var ancestors = ResourceAncestors.Empty;
-        populateAncestors(node);
-        return ancestors;
+        var parents = ParentChain.Empty;
+        populateParents(node);
+        return parents;
 
-        void populateAncestors(ModelNode node) =>
-            getAncestor(node).Iter(ancestor =>
+        void populateParents(ModelNode node) =>
+            getParent(node).Iter(parent =>
             {
-                ancestors = ancestors.Prepend(ancestor.Model.AssociatedResource, ancestor.Model.Name);
-                populateAncestors(ancestor);
+                parents = parents.Prepend(parent.Model.AssociatedResource, parent.Model.Name);
+                populateParents(parent);
             });
 
-        Option<ModelNode> getAncestor(ModelNode node) =>
-            from ancestorResource in node.Model.AssociatedResource.GetTraversalPredecessor()
-            from ancestor in node.Predecessors
-                                 .Where(predecessor => predecessor.Model.AssociatedResource == ancestorResource)
-                                 .ToImmutableArray() switch
+        Option<ModelNode> getParent(ModelNode node) =>
+            from parentResource in node.Model.AssociatedResource.GetTraversalPredecessor()
+            from parent in node.Predecessors
+                               .Where(predecessor => predecessor.Model.AssociatedResource == parentResource)
+                               .ToImmutableArray() switch
             {
                 [var predecessor] => Option.Some(predecessor),
                 [] => Option.None,
-                _ => throw new InvalidOperationException($"Multiple predecessors found for resource {ancestorResource.GetType().Name}.")
+                _ => throw new InvalidOperationException($"Multiple predecessors found for resource {parentResource.GetType().Name}.")
             }
-            select ancestor;
+            select parent;
     }
 
     public static string ToResourceId(this ModelNode node) =>
-        node.GetResourceAncestors()
+        node.GetResourceParentChain()
             .Append(node.Model.AssociatedResource, node.Model.Name)
             .ToResourceId();
 
@@ -303,9 +303,9 @@ internal static class ModelNodeSetModule
                     .Head();
     }
 
-    public static Option<ModelNode> Find(this IEnumerable<ModelNode> nodes, ResourceName name, ResourceAncestors ancestors) =>
+    public static Option<ModelNode> Find(this IEnumerable<ModelNode> nodes, ResourceName name, ParentChain parents) =>
         nodes.Find(name)
-             .Where(node => node.GetResourceAncestors() == ancestors)
+             .Where(node => node.GetResourceParentChain() == parents)
              .Head();
 
     private static IEnumerable<ModelNode> Find(this IEnumerable<ModelNode> nodes, ResourceName name) =>
@@ -375,9 +375,9 @@ internal static class ResourceModelsModule
         from node in set.Find(name, predecessors)
         select node;
 
-    public static Option<ModelNode> Find(this ResourceModels models, IResource resource, ResourceName name, ResourceAncestors ancestors) =>
+    public static Option<ModelNode> Find(this ResourceModels models, IResource resource, ResourceName name, ParentChain parents) =>
         from set in models.Find(resource)
-        from node in set.Find(name, ancestors)
+        from node in set.Find(name, parents)
         select node;
 
     public static ImmutableArray<(T Model, ModelNodeSet Predecessors)> Choose<T>(this ResourceModels models) where T : ITestModel<T> =>
