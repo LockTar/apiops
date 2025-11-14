@@ -96,7 +96,12 @@ internal static class ExtractorModule
             var successorParents = parents.Append(resource, name);
             await graph.ListTraversalSuccessors(resource)
                        // Only extract releases under the current API
-                       .Where(successor => resource is not ApiResource || successor is not ApiReleaseResource || ApiRevisionModule.IsRootName(name))
+                       .Where(successor => resource switch
+                       {
+                           ApiResource => successor is not ApiReleaseResource || ApiRevisionModule.IsRootName(name),
+                           WorkspaceApiResource => successor is not WorkspaceApiReleaseResource || ApiRevisionModule.IsRootName(name),
+                           _ => true
+                       })
                        .IterTaskParallel(async successor => await processResource(successor, successorParents, cancellationToken),
                                          maxDegreeOfParallelism: Option.None,
                                          cancellationToken);
@@ -145,6 +150,13 @@ internal static class ExtractorModule
                      && (name == GroupResource.Administrators || name == GroupResource.Developers || name == GroupResource.Guests))
             {
                 logger.LogWarning("Skipping system group '{Name}'...", name);
+                return false;
+            }
+            // Never extract workspace system groups
+            else if (resource is WorkspaceGroupResource
+                     && (name == WorkspaceGroupResource.Administrators || name == WorkspaceGroupResource.Developers || name == WorkspaceGroupResource.Guests))
+            {
+                logger.LogWarning("Skipping workspace system group '{Name}'...", name);
                 return false;
             }
             // Check from configuration. If no configuration was defined for the resource type, extract all.
@@ -205,16 +217,26 @@ internal static class ExtractorModule
 
                 if (resource is ApiResource)
                 {
-                    var option = await getApiSpecification(name, dto, cancellationToken);
-                    await option.IterTask(async tuple =>
-                    {
-                        var (specification, contents) = tuple;
+                    await writeSpecification(resourceKey, dto, cancellationToken);
+                }
 
-                        logger.LogInformation("Writing specification file for {ResourceKey}...", resourceKey);
-                        await writeApiSpecificationFile(name, specification, contents, cancellationToken);
-                    });
+                if (resource is WorkspaceApiResource)
+                {
+                    await writeSpecification(resourceKey, dto, cancellationToken);
                 }
             });
         };
+
+        async ValueTask writeSpecification(ResourceKey resourceKey, JsonObject dto, CancellationToken cancellationToken)
+        {
+            var option = await getApiSpecification(resourceKey, dto, cancellationToken);
+            await option.IterTask(async tuple =>
+            {
+                var (specification, contents) = tuple;
+
+                logger.LogInformation("Writing specification file for {ResourceKey}...", resourceKey);
+                await writeApiSpecificationFile(resourceKey, specification, contents, cancellationToken);
+            });
+        }
     }
 }

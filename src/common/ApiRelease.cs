@@ -70,9 +70,11 @@ public static partial class ResourceModule
 
         var uri = resource.GetUri(name, ancestors, serviceUri);
         var formattedDto = formatDto(dto);
+        
         var result = await pipeline.PutJson(uri, formattedDto, cancellationToken);
         result.IfErrorThrow();
 
+        // Set the API ID if it's missing from the DTO
         JsonObject formatDto(JsonObject dtoJson)
         {
             var serializerOptions = ((IResourceWithDto)resource).SerializerOptions;

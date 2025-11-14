@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Linq;
+using System.Reflection;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
@@ -20,6 +21,36 @@ internal delegate ValueTask<bool> ShouldSkipResource(ResourceKey resourceKey, Ca
 
 internal static class ServiceModule
 {
+    private static readonly Lazy<ImmutableHashSet<IResource>> testResources = new(ListTestResources);
+
+    private static ImmutableHashSet<IResource> ListTestResources()
+    {
+        return [.. from type in typeof(ITestModel<>).Assembly.GetTypes()
+                   where isTestModel(type)
+                   select getResource(type) ];
+
+        static bool isTestModel(Type type) =>
+            type.IsClass
+            && type.IsAbstract is false
+            && type.GetInterfaces()
+                   .Any(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(ITestModel<>));
+
+        static IResource getResource(Type type)
+        {
+            var propertyName = nameof(ITestModel<>.AssociatedResource);
+            var property = type.GetProperty(propertyName,
+                                            BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy)
+                           ?? throw new InvalidOperationException($"Type {type.FullName} must expose a public static {propertyName} property.");
+
+            if (property.GetValue(null) is not IResource resource)
+            {
+                throw new InvalidOperationException($"Type {type.FullName}'s property {propertyName} must implement {nameof(IResource)}.");
+            }
+
+            return resource;
+        }
+    }
+
     public static void ConfigureEmptyService(IHostApplicationBuilder builder)
     {
         ResourceGraphModule.ConfigureResourceGraph(builder);
@@ -58,8 +89,12 @@ internal static class ServiceModule
                                                  cancellationToken);
         };
 
-        async ValueTask emptyResource(IResource resource, ConcurrentDictionary<IResource, Lazy<Task>> tasks, CancellationToken cancellationToken) =>
-            await tasks.GetOrAdd(resource, _ => new(async () =>
+        async ValueTask emptyResource(IResource resource, ConcurrentDictionary<IResource, Lazy<Task>> tasks, CancellationToken cancellationToken)
+        {
+            await tasks.GetOrAdd(resource, _ => new(emptyResourceInner))
+                       .Value;
+
+            async Task emptyResourceInner()
             {
                 // Skip unsupported resources
                 if (await isSkuSupported(resource, cancellationToken) is false)
@@ -104,11 +139,12 @@ internal static class ServiceModule
 
                         break;
                 }
-            })).Value;
+            }
+        }
 
         IEnumerable<IResource> getDependentRootResources(IResource resource)
         {
-            var successors = graph.ListSortingSuccessors(resource);
+            var successors = graph.ListDependents(resource);
             var successorParents = from successor in successors
                                    select getParentRootResource(successor);
 
@@ -130,7 +166,10 @@ internal static class ServiceModule
             };
 
         async ValueTask bulkDelete(IAsyncEnumerable<ResourceKey> resources, CancellationToken cancellationToken) =>
-            await resources.Where(async (resourceKey, cancellationToken) => await shouldSkipResource(resourceKey, cancellationToken) is false)
+            await resources// Don't delete resources that should be skipped
+                           .Where(async (resourceKey, cancellationToken) => await shouldSkipResource(resourceKey, cancellationToken) is false)
+                           // Don't delete resources that don't have test models
+                           .Where(resourceKey => testResources.Value.Contains(resourceKey.Resource))
                            .Chunk(50)
                            .IterTask(async chunk =>
                            {
@@ -178,8 +217,12 @@ internal static class ServiceModule
                                           cancellationToken);
         };
 
-        async ValueTask putModel(ModelNode node, ResourceModels resourceModels, ConcurrentDictionary<ModelNode, Lazy<Task>> tasks, CancellationToken cancellationToken) =>
-            await tasks.GetOrAdd(node, _ => new Lazy<Task>(async () =>
+        async ValueTask putModel(ModelNode node, ResourceModels resourceModels, ConcurrentDictionary<ModelNode, Lazy<Task>> tasks, CancellationToken cancellationToken)
+        {
+            await tasks.GetOrAdd(node, _ => new Lazy<Task>(putModelInner))
+                       .Value;
+
+            async Task putModelInner()
             {
                 // Skip non-DTO models
                 if (node.Model.AssociatedResource is not IResourceWithDto resource
@@ -221,6 +264,13 @@ internal static class ServiceModule
                             await putInApim(resource, name, dto, parents, cancellationToken);
 
                             // Put API specification
+                            var resourceKey = new ResourceKey
+                            {
+                                Resource = resource,
+                                Name = name,
+                                Parents = parents
+                            };
+
                             var option = from specification in apiModel.Type switch
                             {
                                 ApiType.Http => Option.Some<ApiSpecification>(new ApiSpecification.OpenApi
@@ -236,7 +286,7 @@ internal static class ServiceModule
                                          let contents = BinaryData.FromString(contentsString)
                                          select (specification, contents);
 
-                            await option.IterTask(async tuple => await putApiSpecification(name, tuple.specification, tuple.contents, cancellationToken));
+                            await option.IterTask(async tuple => await putApiSpecification(resourceKey, tuple.specification, tuple.contents, cancellationToken));
 
                             break;
                         }
@@ -247,7 +297,8 @@ internal static class ServiceModule
                             break;
                         }
                 }
-            })).Value.ConfigureAwait(true);
+            }
+        }
     }
 
     public static void ConfigureShouldSkipResource(IHostApplicationBuilder builder)

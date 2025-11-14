@@ -235,7 +235,7 @@ public static partial class ResourceModule
     }
 }
 
-public static class ResourceTraversalExtensions
+public static class ResourceExtensions
 {
     public static Option<IResource> GetTraversalPredecessor(this IResource resource) =>
         resource switch
@@ -250,27 +250,32 @@ public static class ResourceTraversalExtensions
                 .Map(predecessor => ImmutableArray.Create([.. predecessor.GetTraversalPredecessorHierarchy(), predecessor]))
                 .IfNone(() => []);
 
-    public static ImmutableHashSet<IResource> GetSortingPredecessors(this IResource resource)
+    public static ImmutableHashSet<IResource> ListDependencies(this IResource resource)
     {
-        List<IResource> predecessors = [];
+        var list = new List<IResource>();
 
         if (resource is IChildResource child)
         {
-            predecessors.Add(child.Parent);
+            list.Add(child.Parent);
         }
 
         if (resource is ICompositeResource composite)
         {
-            predecessors.Add(composite.Primary);
-            predecessors.Add(composite.Secondary);
+            list.Add(composite.Primary);
+            list.Add(composite.Secondary);
         }
 
         if (resource is IResourceWithReference withReference)
         {
-            predecessors.AddRange(withReference.MandatoryReferencedResourceDtoProperties.Keys);
-            predecessors.AddRange(withReference.OptionalReferencedResourceDtoProperties.Keys);
+            list.AddRange(withReference.MandatoryReferencedResourceDtoProperties.Keys);
+            list.AddRange(withReference.OptionalReferencedResourceDtoProperties.Keys);
         }
 
-        return [.. predecessors];
+        if (resource is IPolicyResource)
+        {
+            list.Add(NamedValueResource.Instance);
+        }
+
+        return [.. list];
     }
 }

@@ -138,11 +138,17 @@ internal static partial class ResourceModule
 
         async ValueTask putSpecification(ResourceName name, CancellationToken cancellationToken)
         {
+            var resourceKey = new ResourceKey
+            {
+                Resource = resource,
+                Name = name,
+                Parents = parents
+            };
             var fileOperations = getCurrentFileOperations();
 
-            var specificationOption = await getSpecification(name, fileOperations.ReadFile, cancellationToken);
+            var specificationOption = await getSpecification(resourceKey, fileOperations.ReadFile, cancellationToken);
 
-            await specificationOption.IterTask(async specification => await putSpecificationInApim(name, specification.Specification, specification.Contents, cancellationToken));
+            await specificationOption.IterTask(async specification => await putSpecificationInApim(resourceKey, specification.Specification, specification.Contents, cancellationToken));
         }
     }
 

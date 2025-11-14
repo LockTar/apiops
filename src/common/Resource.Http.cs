@@ -56,10 +56,10 @@ public static partial class ResourceModule
                                          return await isRootResourceSupported(resource, cancellationToken);
                                      }
 
-                                     // Otherwise, look through its predecessors to see if they are supported.
-                                     return await resource.GetSortingPredecessors()
+                                     // Otherwise, make sure all dependencies are supported.
+                                     return await resource.ListDependencies()
                                                           .ToAsyncEnumerable()
-                                                          .AllAsync(async (predecessor, cancellationToken) => await isResourceSupported(predecessor, cancellationToken),
+                                                          .AllAsync(async (dependency, cancellationToken) => await isResourceSupported(dependency, cancellationToken),
                                                                     cancellationToken);
                                  }))
                        .WithCancellation(cancellationToken);
@@ -272,11 +272,20 @@ public static partial class ResourceModule
                 case ApiResource:
                     await PutApiInApim(name, dto, getApimDto, pipeline, serviceUri, cancellationToken);
                     return;
+                case WorkspaceApiResource:
+                    await PutWorkspaceApiInApim(name, dto, parents, getApimDto, pipeline, serviceUri, cancellationToken);
+                    return;
                 case ProductResource:
                     await PutProductInApim(name, dto, pipeline, serviceUri, isResourceSupported, doesResourceExist, listNames, deleteResource, cancellationToken);
                     return;
+                case WorkspaceProductResource:
+                    await PutWorkspaceProductInApim(name, dto, parents, pipeline, serviceUri, isResourceSupported, doesResourceExist, listNames, deleteResource, cancellationToken);
+                    return;
                 case ApiReleaseResource:
                     await PutApiReleaseInApim(name, dto, parents, pipeline, serviceUri, cancellationToken);
+                    return;
+                case WorkspaceApiReleaseResource:
+                    await PutWorkspaceApiReleaseInApim(name, dto, parents, pipeline, serviceUri, cancellationToken);
                     return;
                 default:
                     var uri = resource.GetUri(name, parents, serviceUri);

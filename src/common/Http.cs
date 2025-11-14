@@ -77,8 +77,7 @@ public static class HttpPipelineModule
         var result = await pipeline.GetContent(uri, cancellationToken);
 
         return result.Map(Option.Some)
-                     .IfError(error => error is Error.Exceptional exceptionalError
-                                       && exceptionalError.Exception is HttpRequestException httpRequestException
+                     .IfError(error => error.ToException() is HttpRequestException httpRequestException
                                        && httpRequestException.StatusCode == HttpStatusCode.NotFound
                                         ? Result<Option<BinaryData>>.Success(Option.None)
                                         : error);

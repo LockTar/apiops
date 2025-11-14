@@ -126,6 +126,10 @@ public static partial class ResourceModule
                 return policyFragmentResource.GetCollectionDirectoryInfo(parents, serviceDirectory)
                                              .GetChildDirectory(name.ToString())
                                              .GetChildFile($"policy.xml");
+            case WorkspacePolicyFragmentResource workspacePolicyFragmentResource:
+                return workspacePolicyFragmentResource.GetCollectionDirectoryInfo(parents, serviceDirectory)
+                                                      .GetChildDirectory(name.ToString())
+                                                      .GetChildFile($"policy.xml");
             case IChildResource { Parent: var parent } childResource:
                 if (parent is not IResourceWithDirectory parentResourceWithDirectory)
                 {
@@ -184,6 +188,11 @@ public static partial class ResourceModule
             formattedDto = policyFragmentResource.FormatInformationFileDto(formattedDto);
         }
 
+        if (resource is WorkspacePolicyFragmentResource workspacePolicyFragmentResource)
+        {
+            formattedDto = workspacePolicyFragmentResource.FormatInformationFileDto(formattedDto);
+        }
+
         if (resource is ILinkResource linkResource)
         {
             var name = dto.GetStringProperty("name")
@@ -201,6 +210,11 @@ public static partial class ResourceModule
         if (resource is ApiResource apiResource)
         {
             formattedDto = apiResource.FormatInformationFileDto(formattedDto);
+        }
+
+        if (resource is WorkspaceApiResource workspaceApiResource)
+        {
+            formattedDto = workspaceApiResource.FormatInformationFileDto(formattedDto);
         }
 
         return formattedDto;
@@ -365,6 +379,11 @@ public static partial class ResourceModule
                 option = option.IfNone(() => apiResource.ParseSpecificationFile(file, serviceDirectory));
             }
 
+            if (resource is WorkspaceApiResource workspaceApiResource)
+            {
+                option = option.IfNone(() => workspaceApiResource.ParseSpecificationFile(file, serviceDirectory));
+            }
+
             return option;
         }
     }
@@ -471,6 +490,8 @@ public static partial class ResourceModule
         {
             case PolicyFragmentResource policyFragmentResource:
                 return policyFragmentResource.ParseDirectory(file.Directory, serviceDirectory);
+            case WorkspacePolicyFragmentResource workspacePolicyFragmentResource:
+                return workspacePolicyFragmentResource.ParseDirectory(file.Directory, serviceDirectory);
             case IChildResource childResource:
                 if (childResource.Parent is not IResourceWithDirectory parentResourceWithDirectory)
                 {

@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -218,6 +219,7 @@ internal static class RelationshipsModule
     {
         common.ResourceModule.ConfigureParseResourceFile(builder);
         common.ResourceModule.ConfigureGetInformationFileDto(builder);
+        common.ResourceModule.ConfigureGetPolicyFileContents(builder);
 
         builder.TryAddSingleton(ResolveGetRelationships);
     }
@@ -226,73 +228,139 @@ internal static class RelationshipsModule
     {
         var parseFile = provider.GetRequiredService<ParseResourceFile>();
         var getDto = provider.GetRequiredService<GetInformationFileDto>();
+        var getPolicyFileContents = provider.GetRequiredService<GetPolicyFileContents>();
 
         return async (operations, cancellationToken) =>
         {
             var pairs = new ConcurrentBag<(ResourceKey Predecessor, Option<ResourceKey> SuccessorOption)>();
 
-            await operations.EnumerateServiceDirectoryFiles()
-                            .Choose(async file => await parseFile(file, operations.ReadFile, cancellationToken))
-                            .IterTaskParallel(async key =>
-                            {
-                                // Process child resources
-                                if (key.Resource is IChildResource childResource)
-                                {
-                                    var parent = getParent(childResource, key.Name, key.Parents);
+            // Build resource dictionary
+            var resources = await operations.EnumerateServiceDirectoryFiles()
+                                            .Choose(async file => await parseFile(file, operations.ReadFile, cancellationToken))
+                                            .GroupBy(key => key.Resource)
+                                            .ToDictionaryAsync(group => group.Key,
+                                                               group => group.ToImmutableHashSet(),
+                                                               cancellationToken: cancellationToken);
 
-                                    pairs.Add((parent, key));
-                                }
+            // Build resource relationship pairs
+            await resources.Values
+                           .SelectMany(group => group)
+                           .IterTaskParallel(async key =>
+                           {
+                               // Process child resources
+                               if (key.Resource is IChildResource childResource)
+                               {
+                                   var parent = getParent(childResource, key.Name, key.Parents);
 
-                                // Get DTO from information file resources
-                                var dtoOption = Option<JsonObject>.None();
-                                if (key.Resource is IResourceWithInformationFile resourceWithInformationFile)
-                                {
-                                    dtoOption = await getDto(resourceWithInformationFile, key.Name, key.Parents, operations.ReadFile, operations.GetSubDirectories, cancellationToken);
-                                }
+                                   pairs.Add((parent, key));
+                               }
 
-                                // Process composite resources
-                                if (key.Resource is ICompositeResource compositeResource)
-                                {
-                                    var primary = getPrimary(compositeResource, key.Name, key.Parents);
-                                    pairs.Add((primary, key));
+                               // Get DTO from information file resources
+                               var dtoOption = Option<JsonObject>.None();
+                               if (key.Resource is IResourceWithInformationFile resourceWithInformationFile)
+                               {
+                                   dtoOption = await getDto(resourceWithInformationFile, key.Name, key.Parents, operations.ReadFile, operations.GetSubDirectories, cancellationToken);
+                               }
 
-                                    var dto = dtoOption.IfNone(() => throw new InvalidOperationException($"Could not get DTO for resource '{key}'."));
+                               // Process composite resources
+                               if (key.Resource is ICompositeResource compositeResource)
+                               {
+                                   var primary = getPrimary(compositeResource, key.Name, key.Parents);
+                                   pairs.Add((primary, key));
 
-                                    var secondary = getSecondary(compositeResource, key.Name, key.Parents, dto)
-                                                        .IfNone(() => throw new InvalidOperationException($"Could not get secondary resource for composite resource '{key}'."));
-                                    pairs.Add((secondary, key));
-                                }
+                                   var dto = dtoOption.IfNone(() => throw new InvalidOperationException($"Could not get DTO for resource '{key}'."));
 
-                                // Process resources with references
-                                if (key.Resource is IResourceWithReference resourceWithReference)
-                                {
-                                    var dto = dtoOption.IfNone(() => throw new InvalidOperationException($"Could not get DTO for resource '{key}'."));
+                                   var secondary = getSecondary(compositeResource, key.Name, key.Parents, dto)
+                                                       .IfNone(() => throw new InvalidOperationException($"Could not get secondary resource for composite resource '{key}'."));
+                                   pairs.Add((secondary, key));
+                               }
 
-                                    getReferences(resourceWithReference, key.Name, key.Parents, dto, cancellationToken)
-                                        .Iter(reference => pairs.Add((reference, key)));
-                                }
+                               // Process resources with references
+                               if (key.Resource is IResourceWithReference resourceWithReference)
+                               {
+                                   var dto = dtoOption.IfNone(() => throw new InvalidOperationException($"Could not get DTO for resource '{key}'."));
 
-                                // Process non-root API revisions
-                                if (key.Resource is ApiResource)
-                                {
-                                    ApiRevisionModule.Parse(key.Name)
-                                                     .Iter(x =>
-                                                     {
-                                                         var (rootName, _) = x;
-                                                         var currentRevision = new ResourceKey
-                                                         {
-                                                             Resource = key.Resource,
-                                                             Name = rootName,
-                                                             Parents = key.Parents
-                                                         };
-                                                         pairs.Add((currentRevision, key));
-                                                     });
-                                }
+                                   getReferences(resourceWithReference, key.Name, key.Parents, dto, cancellationToken)
+                                       .Iter(reference => pairs.Add((reference, key)));
+                               }
 
-                                // Add the resource with no successor. Previous registrations will still be preserved.
-                                pairs.Add((key, Option.None));
-                            }, maxDegreeOfParallelism: Option.None, cancellationToken);
+                               // Process policies for named value references
+                               if (key.Resource is IPolicyResource policyResource)
+                               {
+                                   var policyContentOption = await getPolicyFileContents(policyResource, key.Name, key.Parents, operations.ReadFile, cancellationToken);
 
+                                   policyContentOption.Iter(policyContent =>
+                                   {
+                                       // Get workspace associated with the policy (if any)
+                                       var workspaceOption = key.Parents.Head(tuple => tuple.Resource is WorkspaceResource);
+
+                                       // Extract all named values from the policy
+                                       getPolicyNamedValues(policyContent)
+                                           .Choose(namedValueName =>
+                                                    // Look for the named value in the same workspace
+                                                    workspaceOption.Bind(workspace => from workspaceNamedValues in resources.Find(WorkspaceNamedValueResource.Instance)
+                                                                                      from workspaceNamedValue in
+                                                                                        workspaceNamedValues.Head(key => key.Parents.Any(parent => parent == workspace)
+                                                                                                                         && key.Name == namedValueName)
+                                                                                      select workspaceNamedValue)
+                                                    // If not found, look for a service-level named value
+                                                                       .IfNone(() => from namedValues in resources.Find(NamedValueResource.Instance)
+                                                                                     from namedValue in
+                                                                                         namedValues.Head(key => key.Name == namedValueName)
+                                                                                     select namedValue))
+                                           .Iter(namedValue => pairs.Add((namedValue, key)), cancellationToken);
+                                   });
+                               }
+
+                               // Process non-root API revisions
+                               if (key.Resource is ApiResource)
+                               {
+                                   ApiRevisionModule.Parse(key.Name)
+                                                    .Iter(x =>
+                                                    {
+                                                        var (rootName, _) = x;
+                                                        var currentRevision = new ResourceKey
+                                                        {
+                                                            Resource = key.Resource,
+                                                            Name = rootName,
+                                                            Parents = key.Parents
+                                                        };
+                                                        pairs.Add((currentRevision, key));
+                                                    });
+                               }
+
+                               // Process non-root workspace API revisions
+                               if (key.Resource is WorkspaceApiResource)
+                               {
+                                   ApiRevisionModule.Parse(key.Name)
+                                                    .Iter(x =>
+                                                    {
+                                                        var (rootName, _) = x;
+                                                        var currentRevision = new ResourceKey
+                                                        {
+                                                            Resource = key.Resource,
+                                                            Name = rootName,
+                                                            Parents = key.Parents
+                                                        };
+                                                        pairs.Add((currentRevision, key));
+                                                    });
+                               }
+
+                               // Add the resource with no successor. Previous registrations will still be preserved.
+                               pairs.Add((key, Option.None));
+                           }, maxDegreeOfParallelism: Option.None, cancellationToken);
+
+            // Some resources are not required to have artifacts.
+            // For example, it's valid to have '/products/productA/groups/administrators/productGroupInformation.json'
+            // without '/groups/administrators/groupInformation.json' since the extractor skips the administrators group
+            var predecessorsWithOptionalArtifacts = pairs.Where(pair => pair.SuccessorOption.IsSome)
+                                                         .Select(pair => pair.Predecessor)
+                                                         .Where(isPredecessorWithOptionalArtifacts)
+                                                         .ToImmutableHashSet();
+
+            predecessorsWithOptionalArtifacts.Iter(key => pairs.Add((key, Option.None)), cancellationToken);
+
+            // Build relationships
             return Relationships.From(pairs, cancellationToken);
         };
 
@@ -412,5 +480,37 @@ internal static class RelationshipsModule
                     _ => Error.From($"Expected '{id}' to match the format '...{parents.ToResourceId()}/{resource.CollectionUriPath}/{{name}}'.")
                 };
         }
+
+        static ImmutableHashSet<ResourceName> getPolicyNamedValues(BinaryData policyContent)
+        {
+            var policyContentText = policyContent.ToString();
+
+            if (string.IsNullOrWhiteSpace(policyContentText))
+            {
+                return [];
+            }
+
+            var regex = new Regex("{{\\s*(.*?)\\s*}}", RegexOptions.CultureInvariant);
+
+            return [.. regex.Matches(policyContentText)
+                            .Choose(match => ResourceName.From(match.Groups[1].Value.Trim())
+                                                         .ToOption())];
+        }
+
+        static bool isPredecessorWithOptionalArtifacts(ResourceKey key) =>
+            key.Resource switch
+            {
+                ApiOperationResource => true,
+                WorkspaceApiOperationResource => true,
+                GroupResource
+                    when key.Name == GroupResource.Administrators
+                         || key.Name == GroupResource.Developers
+                         || key.Name == GroupResource.Guests => true,
+                WorkspaceGroupResource
+                    when key.Name == WorkspaceGroupResource.Administrators
+                         || key.Name == WorkspaceGroupResource.Developers
+                         || key.Name == WorkspaceGroupResource.Guests => true,
+                _ => false
+            };
     }
 }

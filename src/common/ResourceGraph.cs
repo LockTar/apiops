@@ -22,7 +22,7 @@ public sealed record ResourceGraph
 
         resources.Iter(resource =>
         {
-            var predecessors = resource.GetSortingPredecessors();
+            var predecessors = resource.ListDependencies();
 
             predecessorDictionary.TryAdd(resource, predecessors);
 
@@ -99,10 +99,10 @@ public sealed record ResourceGraph
                                               where predecessor == resource
                                               select potentialSuccessor)];
 
-    public ImmutableHashSet<IResource> ListSortingSuccessors(IResource resource) =>
-        [.. from potentialSuccessor in TopologicallySortedResources
-            where potentialSuccessor.GetSortingPredecessors().Contains(resource)
-            select potentialSuccessor];
+    public ImmutableHashSet<IResource> ListDependents(IResource resource) =>
+        [.. from potentialDependent in TopologicallySortedResources
+            where potentialDependent.ListDependencies().Contains(resource)
+            select potentialDependent];
 }
 
 public static class ResourceGraphModule
@@ -115,26 +115,50 @@ public static class ResourceGraphModule
         var cancellationToken = CancellationToken.None;
 
         return ResourceGraph.From([ServicePolicyResource.Instance,
-                                   ProductResource.Instance,
-                                   ProductApiResource.Instance,
-                                   ProductPolicyResource.Instance,
-                                   ProductGroupResource.Instance,
-                                   NamedValueResource.Instance,
-                                   TagResource.Instance,
-                                   TagApiResource.Instance,
-                                   TagProductResource.Instance,
-                                   ApiResource.Instance,
-                                   ApiReleaseResource.Instance,
-                                   ApiPolicyResource.Instance,
-                                   ApiDiagnosticResource.Instance,
-                                   BackendResource.Instance,
-                                   GatewayResource.Instance,
-                                   GatewayApiResource.Instance,
-                                   LoggerResource.Instance,
-                                   VersionSetResource.Instance,
-                                   DiagnosticResource.Instance,
-                                   GroupResource.Instance,
-                                   SubscriptionResource.Instance,
-                                   PolicyFragmentResource.Instance], cancellationToken);
+                       ProductResource.Instance,
+                       ProductApiResource.Instance,
+                       ProductPolicyResource.Instance,
+                       ProductGroupResource.Instance,
+                       NamedValueResource.Instance,
+                       TagResource.Instance,
+                       TagApiResource.Instance,
+                       TagProductResource.Instance,
+                       ApiResource.Instance,
+                       ApiReleaseResource.Instance,
+                       ApiPolicyResource.Instance,
+                       ApiDiagnosticResource.Instance,
+                       ApiOperationResource.Instance,
+                       ApiOperationPolicyResource.Instance,
+                       BackendResource.Instance,
+                       GatewayResource.Instance,
+                       GatewayApiResource.Instance,
+                       LoggerResource.Instance,
+                       VersionSetResource.Instance,
+                       DiagnosticResource.Instance,
+                       GroupResource.Instance,
+                       SubscriptionResource.Instance,
+                       PolicyFragmentResource.Instance,
+                       WorkspaceResource.Instance,
+                       WorkspaceGroupResource.Instance,
+                       WorkspaceNamedValueResource.Instance,
+                       WorkspaceBackendResource.Instance,
+                       WorkspaceLoggerResource.Instance,
+                       WorkspaceTagResource.Instance,
+                       WorkspaceVersionSetResource.Instance,
+                       WorkspaceApiResource.Instance,
+                       WorkspaceApiReleaseResource.Instance,
+                       WorkspaceApiPolicyResource.Instance,
+                       WorkspaceApiDiagnosticResource.Instance,
+                       WorkspaceApiOperationResource.Instance,
+                       WorkspaceApiOperationPolicyResource.Instance,
+                       WorkspaceTagApiResource.Instance,
+                       WorkspacePolicyFragmentResource.Instance,
+                       WorkspaceProductResource.Instance,
+                       WorkspaceTagProductResource.Instance,
+                       WorkspaceProductApiResource.Instance,
+                       WorkspaceProductPolicyResource.Instance,
+                       WorkspaceProductGroupResource.Instance,
+                       WorkspaceSubscriptionResource.Instance,
+                       WorkspaceDiagnosticResource.Instance], cancellationToken);
     }
 }

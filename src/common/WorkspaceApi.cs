@@ -1,6 +1,7 @@
 using Azure.Core.Pipeline;
 using System;
 using System.Collections.Immutable;
+using System.IO;
 using System.Linq;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -9,9 +10,9 @@ using System.Threading.Tasks;
 
 namespace common;
 
-public sealed record ApiResource : IResourceWithReference
+public sealed record WorkspaceApiResource : IResourceWithReference, IChildResource
 {
-    private ApiResource() { }
+    private WorkspaceApiResource() { }
 
     public string FileName { get; } = "apiInformation.json";
 
@@ -23,22 +24,24 @@ public sealed record ApiResource : IResourceWithReference
 
     public string CollectionUriPath { get; } = "apis";
 
-    public Type DtoType { get; } = typeof(ApiDto);
+    public Type DtoType { get; } = typeof(WorkspaceApiDto);
 
     public ImmutableDictionary<IResource, string> OptionalReferencedResourceDtoProperties { get; } =
         ImmutableDictionary.Create<IResource, string>()
-                           .Add(VersionSetResource.Instance, nameof(ApiDto.Properties.ApiVersionSetId));
+                           .Add(WorkspaceVersionSetResource.Instance, nameof(WorkspaceApiDto.Properties.ApiVersionSetId));
 
-    public static ApiResource Instance { get; } = new();
+    public IResource Parent { get; } = WorkspaceResource.Instance;
+
+    public static WorkspaceApiResource Instance { get; } = new();
 }
 
-public sealed record ApiDto
+public sealed record WorkspaceApiDto
 {
     [JsonPropertyName("properties")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-    public required ApiCreateOrUpdateProperties Properties { get; init; }
+    public required WorkspaceApiCreateOrUpdateProperties Properties { get; init; }
 
-    public record ApiCreateOrUpdateProperties
+    public sealed record WorkspaceApiCreateOrUpdateProperties
     {
         [JsonPropertyName("path")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -66,7 +69,7 @@ public sealed record ApiDto
 
         [JsonPropertyName("apiVersionSet")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public ApiVersionSetContractDetails? ApiVersionSet { get; init; }
+        public WorkspaceApiVersionSetContractDetails? ApiVersionSet { get; init; }
 
         [JsonPropertyName("apiVersionSetId")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -74,11 +77,11 @@ public sealed record ApiDto
 
         [JsonPropertyName("authenticationSettings")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public AuthenticationSettingsContract? AuthenticationSettings { get; init; }
+        public WorkspaceAuthenticationSettingsContract? AuthenticationSettings { get; init; }
 
         [JsonPropertyName("contact")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public ApiContactInformation? Contact { get; init; }
+        public WorkspaceApiContactInformation? Contact { get; init; }
 
         [JsonPropertyName("description")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -98,7 +101,7 @@ public sealed record ApiDto
 
         [JsonPropertyName("license")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public ApiLicenseInformation? License { get; init; }
+        public WorkspaceApiLicenseInformation? License { get; init; }
 
         [JsonPropertyName("protocols")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -116,7 +119,7 @@ public sealed record ApiDto
 
         [JsonPropertyName("subscriptionKeyParameterNames")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public SubscriptionKeyParameterNamesContract? SubscriptionKeyParameterNames { get; init; }
+        public WorkspaceSubscriptionKeyParameterNamesContract? SubscriptionKeyParameterNames { get; init; }
 
         [JsonPropertyName("subscriptionRequired")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -142,20 +145,20 @@ public sealed record ApiDto
 
         [JsonPropertyName("wsdlSelector")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-        public WsdlSelectorContract? WsdlSelector { get; init; }
+        public WorkspaceWsdlSelectorContract? WsdlSelector { get; init; }
 
-        public record AuthenticationSettingsContract
+        public sealed record WorkspaceAuthenticationSettingsContract
         {
             [JsonPropertyName("oAuth2")]
             [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-            public OAuth2AuthenticationSettingsContract? OAuth2 { get; init; }
+            public WorkspaceOAuth2AuthenticationSettingsContract? OAuth2 { get; init; }
 
             [JsonPropertyName("openid")]
             [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-            public OpenIdAuthenticationSettingsContract? OpenId { get; init; }
+            public WorkspaceOpenIdAuthenticationSettingsContract? OpenId { get; init; }
         }
 
-        public record OAuth2AuthenticationSettingsContract
+        public sealed record WorkspaceOAuth2AuthenticationSettingsContract
         {
             [JsonPropertyName("authorizationServerId")]
             [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -166,7 +169,7 @@ public sealed record ApiDto
             public string? Scope { get; init; }
         }
 
-        public record OpenIdAuthenticationSettingsContract
+        public sealed record WorkspaceOpenIdAuthenticationSettingsContract
         {
             [JsonPropertyName("bearerTokenSendingMethods")]
             [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -177,7 +180,7 @@ public sealed record ApiDto
             public string? OpenIdProviderId { get; init; }
         }
 
-        public record ApiContactInformation
+        public sealed record WorkspaceApiContactInformation
         {
             [JsonPropertyName("email")]
             [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -194,7 +197,7 @@ public sealed record ApiDto
 #pragma warning restore CA1056 // URI-like properties should not be strings
         }
 
-        public record ApiLicenseInformation
+        public sealed record WorkspaceApiLicenseInformation
         {
             [JsonPropertyName("name")]
             [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -207,7 +210,7 @@ public sealed record ApiDto
 #pragma warning restore CA1056 // URI-like properties should not be strings
         }
 
-        public record ApiVersionSetContractDetails
+        public sealed record WorkspaceApiVersionSetContractDetails
         {
             [JsonPropertyName("description")]
             [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -234,7 +237,7 @@ public sealed record ApiDto
             public string? VersioningScheme { get; init; }
         }
 
-        public record SubscriptionKeyParameterNamesContract
+        public sealed record WorkspaceSubscriptionKeyParameterNamesContract
         {
             [JsonPropertyName("header")]
             [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -245,7 +248,7 @@ public sealed record ApiDto
             public string? Query { get; init; }
         }
 
-        public record WsdlSelectorContract
+        public sealed record WorkspaceWsdlSelectorContract
         {
             [JsonPropertyName("wsdlEndpointName")]
             [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
@@ -260,62 +263,14 @@ public sealed record ApiDto
 
 public static partial class ResourceModule
 {
-    private static async ValueTask PutApiInApim(ResourceName name, JsonObject dto, GetResourceDtoFromApim getApimDto, HttpPipeline pipeline, ServiceUri serviceUri, CancellationToken cancellationToken)
-    {
-        IResourceWithDto resource = ApiResource.Instance;
-        ParentChain parentChain = ParentChain.Empty;
-
-        var uri = resource.GetUri(name, parentChain, serviceUri);
-        var formattedDto = await formatDto();
-
-        var result = await pipeline.PutJson(uri, formattedDto, cancellationToken);        
-        result.IfErrorThrow();
-
-        // Non-current revisions are not allowed to update certain properties.
-        // Replace them with the current revision's properties if necessary.
-        async ValueTask<JsonObject> formatDto()
-        {
-            // If this is the current revision, return the DTO as-is.
-            var rootName = ApiRevisionModule.GetRootName(name);
-            if (name == rootName)
-            {
-                return dto;
-            }
-
-            // Otherwise, get the current revision's DTO from APIM...
-            var existingDto = await getApimDto(resource, rootName, parentChain, cancellationToken);
-
-            // ...and use its properties to format the new revision's DTO.
-            var result = from existingDtoObject in JsonNodeModule.To<ApiDto>(existingDto, resource.SerializerOptions)
-                         from newDtoObject in JsonNodeModule.To<ApiDto>(dto, resource.SerializerOptions)
-                         let formattedDtoObject = newDtoObject with
-                         {
-                             Properties = newDtoObject.Properties with
-                             {
-                                 Type = existingDtoObject.Properties.Type,
-                                 Description = existingDtoObject.Properties.Description,
-                                 SubscriptionRequired = existingDtoObject.Properties.SubscriptionRequired,
-                                 ApiVersion = existingDtoObject.Properties.ApiVersion,
-                                 ApiRevisionDescription = existingDtoObject.Properties.ApiRevisionDescription,
-                                 Path = existingDtoObject.Properties.Path,
-                                 Protocols = existingDtoObject.Properties.Protocols
-                             }
-                         }
-                         from updatedDto in JsonObjectModule.From(formattedDtoObject, resource.SerializerOptions)
-                         select updatedDto;
-
-            return result.IfErrorThrow();
-        }
-    }
-
     /// <summary>
     /// If the API type is not 'websocket' or 'graphql', remove the 'serviceUrl' property from the API information file DTO.
     /// </summary>
-    private static JsonObject FormatInformationFileDto(this ApiResource resource, JsonObject dtoJson)
+    private static JsonObject FormatInformationFileDto(this WorkspaceApiResource resource, JsonObject dtoJson)
     {
         var serializerOptions = ((IResourceWithDto)resource).SerializerOptions;
 
-        var dto = JsonNodeModule.To<ApiDto>(dtoJson, serializerOptions)
+        var dto = JsonNodeModule.To<WorkspaceApiDto>(dtoJson, serializerOptions)
                                 .IfErrorThrow();
 
         dto = new[] { "websocket", "graphql" }.Contains(dto.Properties.Type, StringComparer.OrdinalIgnoreCase)
@@ -324,5 +279,69 @@ public static partial class ResourceModule
 
         return JsonObjectModule.From(dto, serializerOptions)
                                .IfErrorThrow();
+    }
+
+    private static Option<(ResourceName Name, ParentChain Ancestors)> ParseSpecificationFile(this WorkspaceApiResource resource, FileInfo? file, ServiceDirectory serviceDirectory)
+    {
+        if (file is null)
+        {
+            return Option.None;
+        }
+
+        var specificationFileNames = specifications.Select(GetSpecificationFileName);
+        if (specificationFileNames.Contains(file.Name) is false)
+        {
+            return Option.None;
+        }
+
+        return resource.ParseDirectory(file.Directory, serviceDirectory);
+    }
+
+    private static async ValueTask PutWorkspaceApiInApim(ResourceName name,
+                                                         JsonObject dto,
+                                                         ParentChain parents,
+                                                         GetResourceDtoFromApim getApimDto,
+                                                         HttpPipeline pipeline,
+                                                         ServiceUri serviceUri,
+                                                         CancellationToken cancellationToken)
+    {
+        IResourceWithDto resource = WorkspaceApiResource.Instance;
+
+        var uri = resource.GetUri(name, parents, serviceUri);
+        var formattedDto = await formatDto();
+
+        var result = await pipeline.PutJson(uri, formattedDto, cancellationToken);
+        result.IfErrorThrow();
+
+        async ValueTask<JsonObject> formatDto()
+        {
+            var rootName = ApiRevisionModule.GetRootName(name);
+            if (name == rootName)
+            {
+                return dto;
+            }
+
+            var existingDto = await getApimDto(resource, rootName, parents, cancellationToken);
+
+            var workspaceDtoResult = from existingDtoObject in JsonNodeModule.To<WorkspaceApiDto>(existingDto, resource.SerializerOptions)
+                                     from newDtoObject in JsonNodeModule.To<WorkspaceApiDto>(dto, resource.SerializerOptions)
+                                     let formattedDtoObject = newDtoObject with
+                                     {
+                                         Properties = newDtoObject.Properties with
+                                         {
+                                             Type = existingDtoObject.Properties.Type,
+                                             Description = existingDtoObject.Properties.Description,
+                                             SubscriptionRequired = existingDtoObject.Properties.SubscriptionRequired,
+                                             ApiVersion = existingDtoObject.Properties.ApiVersion,
+                                             ApiRevisionDescription = existingDtoObject.Properties.ApiRevisionDescription,
+                                             Path = existingDtoObject.Properties.Path,
+                                             Protocols = existingDtoObject.Properties.Protocols
+                                         }
+                                     }
+                                     from updatedDto in JsonObjectModule.From(formattedDtoObject, resource.SerializerOptions)
+                                     select updatedDto;
+
+            return workspaceDtoResult.IfErrorThrow();
+        }
     }
 }

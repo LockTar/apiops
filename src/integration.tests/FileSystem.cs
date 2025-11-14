@@ -170,7 +170,7 @@ internal static class FileSystemModule
                                  let contents = BinaryData.FromString(contentsString)
                                  select (specification, contents);
 
-                    await option.IterTask(async tuple => await writeApiSpecificationFile(resourceKey.Name, tuple.specification, tuple.contents, cancellationToken));
+                    await option.IterTask(async tuple => await writeApiSpecificationFile(resourceKey, tuple.specification, tuple.contents, cancellationToken));
                 }
             })).Value;
     }

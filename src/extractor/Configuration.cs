@@ -63,8 +63,10 @@ internal static class ConfigurationModule
                          from resourceNodes in parentsJson.GetJsonArrayProperty(resource.PluralName).ToOption()
                          let names = resourceNodes.Choose(getResourceName)
                          select names.Contains(name)
-                                // For APIs, include all revisions if the root API name is in configuration
-                                || resource is ApiResource && names.Contains(ApiRevisionModule.GetRootName(name));
+                            // For APIs, include all revisions if the root API name is in configuration
+                            || (resource is ApiResource && names.Contains(ApiRevisionModule.GetRootName(name)))
+                            // For workspace APIs, include all revisions if the root API name is in configuration
+                            || (resource is WorkspaceApiResource && names.Contains(ApiRevisionModule.GetRootName(name)));
 
             activity?.SetTag("result", result.ToString());
 
@@ -87,6 +89,7 @@ internal static class ConfigurationModule
                                       var (resource, name) = item switch
                                       {
                                           (ApiResource apiResource, var apiName) => (apiResource, ApiRevisionModule.GetRootName(apiName)), // For APIs, use root name when traversing
+                                          (WorkspaceApiResource workspaceApiResource, var apiName) => (workspaceApiResource, ApiRevisionModule.GetRootName(apiName)), // Workspace APIs use root name when traversing
                                           _ => item
                                       };
 

@@ -16,10 +16,10 @@ using System.Threading.Tasks;
 
 namespace common;
 
-public delegate ValueTask<Option<(ApiSpecification Specification, BinaryData Contents)>> GetApiSpecificationFromApim(ResourceName name, JsonObject dto, CancellationToken cancellationToken);
-public delegate ValueTask<Option<(ApiSpecification Specification, BinaryData Contents)>> GetApiSpecificationFromFile(ResourceName name, ReadFile readFile, CancellationToken cancellationToken);
-public delegate ValueTask WriteApiSpecificationFile(ResourceName name, ApiSpecification specification, BinaryData contents, CancellationToken cancellationToken);
-public delegate ValueTask PutApiSpecificationInApim(ResourceName name, ApiSpecification specification, BinaryData contents, CancellationToken cancellationToken);
+public delegate ValueTask<Option<(ApiSpecification Specification, BinaryData Contents)>> GetApiSpecificationFromApim(ResourceKey resourceKey, JsonObject dto, CancellationToken cancellationToken);
+public delegate ValueTask<Option<(ApiSpecification Specification, BinaryData Contents)>> GetApiSpecificationFromFile(ResourceKey resourceKey, ReadFile readFile, CancellationToken cancellationToken);
+public delegate ValueTask WriteApiSpecificationFile(ResourceKey resourceKey, ApiSpecification specification, BinaryData contents, CancellationToken cancellationToken);
+public delegate ValueTask PutApiSpecificationInApim(ResourceKey resourceKey, ApiSpecification specification, BinaryData contents, CancellationToken cancellationToken);
 
 public abstract record ApiSpecification
 {
@@ -113,28 +113,46 @@ public static partial class ResourceModule
         var pipeline = provider.GetRequiredService<HttpPipeline>();
         var configuration = provider.GetRequiredService<IConfiguration>();
 
-        var resource = ApiResource.Instance;
-
-        return async (name, dto, cancellationToken) =>
+        return async (resourceKey, dto, cancellationToken) =>
         {
-            var specificationOption = getSpecification(dto);
+            var (resource, name, parents) = (resourceKey.Resource, resourceKey.Name, resourceKey.Parents);
 
-            return await specificationOption.BindTask(async specification => from contents in await getSpecificationContents(name, specification, cancellationToken)
+            if (resource is not ApiResource && resource is not WorkspaceApiResource)
+            {
+                return Option.None;
+            }
+
+            var specificationOption = getSpecification(resource, dto);
+
+            return await specificationOption.BindTask(async specification => from contents in await getSpecificationContents(resourceKey, specification, cancellationToken)
                                                                              select (specification, contents));
         };
 
-        Option<ApiSpecification> getSpecification(JsonObject dtoJson)
+        Option<ApiSpecification> getSpecification(IResource resource, JsonObject dtoJson)
         {
+            var apiType = string.Empty;
             var serializerOptions = ((IResourceWithDto)resource).SerializerOptions;
-            var dto = JsonNodeModule.To<ApiDto>(dtoJson, serializerOptions)
-                                    .IfErrorThrow();
 
-            return dto.Properties.Type switch
+            switch (resource)
             {
-                "http" => Option.Some(getDefaultSpecification()),
-                "graphql" => ApiSpecification.GraphQl.Instance,
-                "soap" => ApiSpecification.Wsdl.Instance,
-                null => getDefaultSpecification(),
+                case ApiResource:
+                    apiType = JsonNodeModule.To<ApiDto>(dtoJson, serializerOptions)
+                                            .IfErrorThrow()
+                                            .Properties.Type;
+                    break;
+                case WorkspaceApiResource:
+                    apiType = JsonNodeModule.To<WorkspaceApiDto>(dtoJson, serializerOptions)
+                                            .IfErrorThrow()
+                                            .Properties.Type;
+                    break;
+            }
+
+            return apiType switch
+            {
+                null => Option.Some(getDefaultSpecification()),
+                var value when "http".Equals(value, StringComparison.OrdinalIgnoreCase) => Option.Some(getDefaultSpecification()),
+                var value when "graphql".Equals(value, StringComparison.OrdinalIgnoreCase) => Option<ApiSpecification>.Some(ApiSpecification.GraphQl.Instance),
+                var value when "soap".Equals(value, StringComparison.OrdinalIgnoreCase) => Option<ApiSpecification>.Some(ApiSpecification.Wsdl.Instance),
                 _ => Option.None
             };
         }
@@ -192,14 +210,17 @@ public static partial class ResourceModule
                             Version = OpenApiVersion.V3.Instance
                         });
 
-        async ValueTask<Option<BinaryData>> getSpecificationContents(ResourceName name, ApiSpecification specification, CancellationToken cancellationToken)
+        async ValueTask<Option<BinaryData>> getSpecificationContents(ResourceKey resourceKey, ApiSpecification specification, CancellationToken cancellationToken)
         {
+            var (resource, name, parents) = (resourceKey.Resource, resourceKey.Name, resourceKey.Parents);
+
             switch (specification)
             {
                 case ApiSpecification.GraphQl:
-                    return await getGraphQlSpecificationContents(name, cancellationToken);
+                    return await getGraphQlSpecificationContents(resourceKey, cancellationToken);
                 default:
-                    var exportUri = resource.GetUri(name, ParentChain.Empty, serviceUri)
+                    // Get a link to download the specification
+                    var exportUri = resource.GetUri(name, parents, serviceUri)
                                             .SetQueryParam("format", specification switch
                                             {
                                                 ApiSpecification.Wsdl => "wsdl-link",
@@ -219,14 +240,15 @@ public static partial class ResourceModule
                                             select new Uri(link);
                     var downloadUri = downloadUriResult.IfErrorThrow();
 
-                    // The export link does not support authentication, so use an unauthenticated pipeline.
+                    // The link does not support authentication, so use an unauthenticated pipeline.
                     var unauthenticatedPipeline = HttpPipelineBuilder.Build(ClientOptions.Default);
                     var contentResult = await unauthenticatedPipeline.GetContent(downloadUri, cancellationToken);
                     var content = contentResult.IfErrorThrow();
 
                     // APIM always exports Open API v2 to JSON. Convert to YAML if needed.
                     if (specification is ApiSpecification.OpenApi openApi2
-                        && (openApi2.Format, openApi2.Version) is (OpenApiFormat.Yaml, OpenApiVersion.V2))
+                        && openApi2.Version is OpenApiVersion.V2
+                        && openApi2.Format is not OpenApiFormat.Json)
                     {
                         content = await convertOpenApiContent(content, openApi2.Format, openApi2.Version, cancellationToken);
                     }
@@ -235,12 +257,22 @@ public static partial class ResourceModule
             }
         }
 
-        async ValueTask<Option<BinaryData>> getGraphQlSpecificationContents(ResourceName name, CancellationToken cancellationToken)
+        async ValueTask<Option<BinaryData>> getGraphQlSpecificationContents(ResourceKey resourceKey, CancellationToken cancellationToken)
         {
-            var schemaResource = ApiSchemaResource.Instance;
-            var serializerOptions = ((IResourceWithDto)schemaResource).SerializerOptions;
+            var (resource, name, parents) = (resourceKey.Resource, resourceKey.Name, resourceKey.Parents);
+
             var schemaName = ResourceName.From("graphql").IfErrorThrow();
-            var schemaAncestors = ParentChain.From([(resource, name)]);
+
+            IResourceWithDto schemaResource = resource switch
+            {
+                ApiResource => ApiSchemaResource.Instance,
+                WorkspaceApiResource => WorkspaceApiSchemaResource.Instance,
+                _ => throw new InvalidOperationException($"Getting schema for {resourceKey} is not supported.")
+            };
+
+            var serializerOptions = schemaResource.SerializerOptions;
+
+            var schemaAncestors = parents.Append(resource, name);
 
             return from dto in await getOptionalDto(schemaResource, schemaName, schemaAncestors, cancellationToken)
                    let result = from dtoObject in JsonNodeModule.To<ApiSchemaDto>(dto, serializerOptions)
@@ -316,10 +348,8 @@ public static partial class ResourceModule
     {
         var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
 
-        var resource = ApiResource.Instance;
-
-        return async (name, readFile, cancellationToken) =>
-            await specifications.Select(specification => resource.GetSpecificationFile(name, specification, serviceDirectory))
+        return async (resourceKey, readFile, cancellationToken) =>
+            await specifications.Choose(specification => GetSpecificationFile(resourceKey, specification, serviceDirectory))
                                 .Choose(async file => await getSpecification(file, readFile, cancellationToken))
                                 .Head(cancellationToken);
 
@@ -340,10 +370,26 @@ public static partial class ResourceModule
         }
     }
 
-    private static FileInfo GetSpecificationFile(this ApiResource resource, ResourceName name, ApiSpecification specification, ServiceDirectory serviceDirectory) =>
-        resource.GetCollectionDirectoryInfo(ParentChain.Empty, serviceDirectory)
-                .GetChildDirectory(name.ToString())
-                .GetChildFile(GetSpecificationFileName(specification));
+    private static Option<FileInfo> GetSpecificationFile(ResourceKey resourceKey, ApiSpecification specification, ServiceDirectory serviceDirectory)
+    {
+        var (resource, name, parents) = (resourceKey.Resource, resourceKey.Name, resourceKey.Parents);
+
+        if (resource is not IResourceWithDirectory resourceWithDirectory)
+        {
+            return Option.None;
+        }
+
+        if (resource is not (ApiResource or WorkspaceApiResource))
+        {
+            return Option.None;
+        }
+
+        var specificationFileName = GetSpecificationFileName(specification);
+
+        return resourceWithDirectory.GetCollectionDirectoryInfo(parents, serviceDirectory)
+                                    .GetChildDirectory(name.ToString())
+                                    .GetChildFile(specificationFileName);
+    }
 
     private static string GetSpecificationFileName(ApiSpecification specification) =>
         $"specification.{specification switch
@@ -417,12 +463,11 @@ public static partial class ResourceModule
     {
         var serviceDirectory = provider.GetRequiredService<ServiceDirectory>();
 
-        var resource = ApiResource.Instance;
-
-        return async (name, specification, contents, cancellationToken) =>
+        return async (resourceKey, specification, contents, cancellationToken) =>
         {
-            var file = resource.GetSpecificationFile(name, specification, serviceDirectory);
-            await file.OverwriteWithBinaryData(contents, cancellationToken);
+            var fileOption = GetSpecificationFile(resourceKey, specification, serviceDirectory);
+
+            await fileOption.IterTask(async file => await file.OverwriteWithBinaryData(contents, cancellationToken));
         };
     }
 
@@ -446,19 +491,27 @@ public static partial class ResourceModule
         var resource = ApiResource.Instance;
         var ancestors = ParentChain.Empty;
 
-        return async (name, specification, contents, cancellationToken) =>
+        return async (resourceKey, specification, contents, cancellationToken) =>
+        {
+            if (resourceKey.Resource is not ApiResource && resourceKey.Resource is not WorkspaceApiResource)
+            {
+                throw new InvalidOperationException($"Resource '{resourceKey.Resource}' does not support API specifications.");
+            }
+
             await (specification switch
             {
-                ApiSpecification.OpenApi openApiSpecification => putOpenApiSpecification(name, openApiSpecification, contents, cancellationToken),
-                ApiSpecification.Wadl wadlSpecification => putWadlSpecification(name, wadlSpecification, contents, cancellationToken),
-                ApiSpecification.Wsdl wsdlSpecification => putWsdlSpecification(name, wsdlSpecification, contents, cancellationToken),
-                ApiSpecification.GraphQl graphQlSpecification => putGraphQlSpecification(name, graphQlSpecification, contents, cancellationToken),
+                ApiSpecification.OpenApi openApiSpecification => putOpenApiSpecification(resourceKey, openApiSpecification, contents, cancellationToken),
+                ApiSpecification.Wadl wadlSpecification => putWadlSpecification(resourceKey, wadlSpecification, contents, cancellationToken),
+                ApiSpecification.Wsdl wsdlSpecification => putWsdlSpecification(resourceKey, wsdlSpecification, contents, cancellationToken),
+                ApiSpecification.GraphQl graphQlSpecification => putGraphQlSpecification(resourceKey, graphQlSpecification, contents, cancellationToken),
                 _ => throw new InvalidOperationException($"Specification {specification} is not supported.")
             });
+        };
 
-        async ValueTask putOpenApiSpecification(ResourceName name, ApiSpecification.OpenApi specification, BinaryData contents, CancellationToken cancellationToken)
+        async ValueTask putOpenApiSpecification(ResourceKey resourceKey, ApiSpecification.OpenApi specification, BinaryData contents, CancellationToken cancellationToken)
         {
-            var dto = await getDto(resource, name, ancestors, cancellationToken);
+            var resource = (IResourceWithDto)resourceKey.Resource;
+            var dto = await getDto(resource, resourceKey.Name, resourceKey.Parents, cancellationToken);
 
             dto = dto.MergeWith(new JsonObject
             {
@@ -476,12 +529,13 @@ public static partial class ResourceModule
                 }
             }, mutateOriginal: true);
 
-            await putSpecificationDto(name, dto, useImportQueryParameter: false, cancellationToken);
+            await putSpecificationDto(resourceKey, dto, useImportQueryParameter: false, cancellationToken);
         }
 
-        async ValueTask putSpecificationDto(ResourceName name, JsonObject dto, bool useImportQueryParameter, CancellationToken cancellationToken)
+        async ValueTask putSpecificationDto(ResourceKey resourceKey, JsonObject dto, bool useImportQueryParameter, CancellationToken cancellationToken)
         {
-            var uri = resource.GetUri(name, ancestors, serviceUri);
+            var (resource, name, parents) = (resourceKey.Resource, resourceKey.Name, resourceKey.Parents);
+            var uri = resource.GetUri(name, parents, serviceUri);
 
             if (useImportQueryParameter)
             {
@@ -494,7 +548,7 @@ public static partial class ResourceModule
             result.IfErrorThrow();
         }
 
-        async ValueTask putWadlSpecification(ResourceName name, ApiSpecification.Wadl specification, BinaryData contents, CancellationToken cancellationToken)
+        async ValueTask putWadlSpecification(ResourceKey resourceKey, ApiSpecification.Wadl specification, BinaryData contents, CancellationToken cancellationToken)
         {
             var dto = new JsonObject
             {
@@ -505,10 +559,10 @@ public static partial class ResourceModule
                 }
             };
 
-            await putSpecificationDto(name, dto, useImportQueryParameter: true, cancellationToken);
+            await putSpecificationDto(resourceKey, dto, useImportQueryParameter: true, cancellationToken);
         }
 
-        async ValueTask putWsdlSpecification(ResourceName name, ApiSpecification.Wsdl specification, BinaryData contents, CancellationToken cancellationToken)
+        async ValueTask putWsdlSpecification(ResourceKey resourceKey, ApiSpecification.Wsdl specification, BinaryData contents, CancellationToken cancellationToken)
         {
             var dto = new JsonObject
             {
@@ -520,14 +574,30 @@ public static partial class ResourceModule
                 }
             };
 
-            await putSpecificationDto(name, dto, useImportQueryParameter: true, cancellationToken);
+            await putSpecificationDto(resourceKey, dto, useImportQueryParameter: true, cancellationToken);
         }
 
-        async ValueTask putGraphQlSpecification(ResourceName name, ApiSpecification.GraphQl specification, BinaryData contents, CancellationToken cancellationToken)
+        async ValueTask putGraphQlSpecification(ResourceKey resourceKey, ApiSpecification.GraphQl specification, BinaryData contents, CancellationToken cancellationToken)
         {
-            var schemaResource = ApiSchemaResource.Instance;
+            IResourceWithDto schemaResource;
+            ParentChain schemaAncestors;
+
+            if (resourceKey.Resource is ApiResource apiResource)
+            {
+                schemaResource = ApiSchemaResource.Instance;
+                schemaAncestors = ParentChain.From([(apiResource, resourceKey.Name)]);
+            }
+            else if (resourceKey.Resource is WorkspaceApiResource workspaceApiResource)
+            {
+                schemaResource = WorkspaceApiSchemaResource.Instance;
+                schemaAncestors = ParentChain.From([(workspaceApiResource, resourceKey.Name)]);
+            }
+            else
+            {
+                throw new InvalidOperationException($"Resource '{resourceKey.Resource}' does not support GraphQL specifications.");
+            }
+
             var schemaName = ResourceName.From("graphql").IfErrorThrow();
-            var schemaAncestors = ParentChain.From([(resource, name)]);
             var schemaDto = new JsonObject
             {
                 ["properties"] = new JsonObject
@@ -542,5 +612,21 @@ public static partial class ResourceModule
 
             await putResource(schemaResource, schemaName, schemaDto, schemaAncestors, cancellationToken);
         }
+    }
+
+    private static Option<(ResourceName Name, ParentChain Ancestors)> ParseSpecificationFile(this ApiResource resource, FileInfo? file, ServiceDirectory serviceDirectory)
+    {
+        if (file is null)
+        {
+            return Option.None;
+        }
+
+        var specificationFileNames = specifications.Select(GetSpecificationFileName);
+        if (specificationFileNames.Contains(file.Name) is false)
+        {
+            return Option.None;
+        }
+
+        return resource.ParseDirectory(file.Directory, serviceDirectory);
     }
 }

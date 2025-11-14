@@ -143,8 +143,13 @@ internal static partial class ResourceModule
                 }
 
                 // Parse the resource's API specification file
-                if (key.Resource is ApiResource apiResource
-                    && await getApiSpecification(key.Name, readFile.Invoke, cancellationToken) is { IsSome: true })
+                if (key.Resource is ApiResource && await specificationExists(key, readFile.Invoke, cancellationToken))
+                {
+                    return true;
+                }
+
+                // Parse the resource's workspace API specification file
+                if (key.Resource is WorkspaceApiResource && await specificationExists(key, readFile.Invoke, cancellationToken))
                 {
                     return true;
                 }
@@ -152,12 +157,19 @@ internal static partial class ResourceModule
                 return false;
             }
         };
+
+        async ValueTask<bool> specificationExists(ResourceKey resourceKey, ReadFile readFile, CancellationToken cancellationToken)
+        {
+            var specificationOption = await getApiSpecification(resourceKey, readFile, cancellationToken);
+            return specificationOption.IsSome;
+        }
     }
 
     public static void ConfigurePutResource(IHostApplicationBuilder builder)
     {
         ConfigureGetDto(builder);
         ConfigurePutApi(builder);
+        ConfigurePutWorkspaceApi(builder);
 
         common.ResourceModule.ConfigurePutResourceInApim(builder);
 
@@ -168,6 +180,7 @@ internal static partial class ResourceModule
     {
         var getDto = provider.GetRequiredService<GetDto>();
         var putApi = provider.GetRequiredService<PutApi>();
+        var putWorkspaceApi = provider.GetRequiredService<PutWorkspaceApi>();
         var putResourceInApim = provider.GetRequiredService<PutResourceInApim>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
         var logger = provider.GetRequiredService<ILogger>();
@@ -207,6 +220,7 @@ internal static partial class ResourceModule
             await (resource switch
             {
                 ApiResource => putApi(name, dto, cancellationToken),
+                WorkspaceApiResource => putWorkspaceApi(name, parents, dto, cancellationToken),
                 _ => putResourceInApim(resource, name, dto, parents, cancellationToken)
             });
     }
@@ -219,6 +233,7 @@ internal static partial class ResourceModule
         common.ResourceModule.ConfigureGetInformationFileDto(builder);
         common.ResourceModule.ConfigureGetPolicyFileContents(builder);
         ConfigureGetPolicyFragmentDto(builder);
+        ConfigureGetWorkspacePolicyFragmentDto(builder);
         ConfigurationModule.ConfigureGetConfigurationOverride(builder);
 
         builder.TryAddSingleton(ResolveGetDto);
@@ -233,6 +248,7 @@ internal static partial class ResourceModule
         var getInformationFileDto = provider.GetRequiredService<GetInformationFileDto>();
         var getPolicyFileContents = provider.GetRequiredService<GetPolicyFileContents>();
         var getPolicyFragmentDto = provider.GetRequiredService<GetPolicyFragmentDto>();
+        var getWorkspacePolicyFragmentDto = provider.GetRequiredService<GetWorkspacePolicyFragmentDto>();
         var getConfigurationOverride = provider.GetRequiredService<GetConfigurationOverride>();
         var logger = provider.GetRequiredService<ILogger>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
@@ -253,7 +269,8 @@ internal static partial class ResourceModule
 
             dtoOption = await mergeDtoWithConfigurationOverride(resourceKey, dtoOption, cancellationToken);
 
-            dtoOption = validateNamedValue(resource, name, dtoOption);
+            dtoOption = validateNamedValue(resourceKey, dtoOption);
+            dtoOption = validateWorkspaceNamedValue(resourceKey, dtoOption);
 
             return dtoOption;
         };
@@ -268,6 +285,8 @@ internal static partial class ResourceModule
             {
                 case PolicyFragmentResource:
                     return await getPolicyFragmentDto(name, cancellationToken);
+                case WorkspacePolicyFragmentResource:
+                    return await getWorkspacePolicyFragmentDto(name, parents, cancellationToken);
                 case IResourceWithInformationFile resourceWithInformationFile:
                     return await getInformationFileDto(resourceWithInformationFile, name, parents, readFile, getSubDirectories, cancellationToken);
                 case IPolicyResource policyResource:
@@ -293,17 +312,36 @@ internal static partial class ResourceModule
                 return option.IfNone(() => dto);
             });
 
-        Option<JsonObject> validateNamedValue(IResource resource, ResourceName name, Option<JsonObject> dtoOption) =>
+        Option<JsonObject> validateNamedValue(ResourceKey resourceKey, Option<JsonObject> dtoOption) =>
             dtoOption.Bind(json =>
             {
                 // Don't put secret named values without a value or Key Vault identifier
-                if (resource is NamedValueResource
+                if (resourceKey.Resource is NamedValueResource
                     && json.Deserialize<NamedValueDto>() is NamedValueDto namedValueDto
                     && namedValueDto.Properties.Secret is true
                     && namedValueDto.Properties.Value is null
                     && namedValueDto.Properties.KeyVault?.SecretIdentifier is null)
                 {
-                    logger.LogWarning("Named value '{Name}' is secret but has no value or key vault identifier. Skipping it...", name);
+                    logger.LogWarning("Named value '{ResourceKey}' is secret but has no value or key vault identifier. Skipping it...", resourceKey);
+                    return Option<JsonObject>.None();
+                }
+                else
+                {
+                    return json;
+                }
+            });
+
+        Option<JsonObject> validateWorkspaceNamedValue(ResourceKey resourceKey, Option<JsonObject> dtoOption) =>
+            dtoOption.Bind(json =>
+            {
+                // Don't put secret named values without a value or Key Vault identifier
+                if (resourceKey.Resource is WorkspaceNamedValueResource
+                    && json.Deserialize<WorkspaceNamedValueDto>() is WorkspaceNamedValueDto namedValueDto
+                    && namedValueDto.Properties.Secret is true
+                    && namedValueDto.Properties.Value is null
+                    && namedValueDto.Properties.KeyVault?.SecretIdentifier is null)
+                {
+                    logger.LogWarning("Named value '{ResourceKey}' is secret but has no value or key vault identifier. Skipping it...", resourceKey);
                     return Option<JsonObject>.None();
                 }
                 else
@@ -327,6 +365,7 @@ internal static partial class ResourceModule
     {
         common.ResourceModule.ConfigureDeleteResourceFromApim(builder);
         ConfigureDeleteApi(builder);
+        ConfigureDeleteWorkspaceApi(builder);
 
         builder.TryAddSingleton(ResolveDeleteResource);
     }
@@ -335,6 +374,7 @@ internal static partial class ResourceModule
     {
         var deleteResourceFromApim = provider.GetRequiredService<DeleteResourceFromApim>();
         var deleteApi = provider.GetRequiredService<DeleteApi>();
+        var deleteWorkspaceApi = provider.GetRequiredService<DeleteWorkspaceApi>();
         var activitySource = provider.GetRequiredService<ActivitySource>();
         var logger = provider.GetRequiredService<ILogger>();
 
@@ -348,6 +388,7 @@ internal static partial class ResourceModule
             await (resourceKey.Resource switch
             {
                 ApiResource => deleteApi(resourceKey.Name, cancellationToken),
+                WorkspaceApiResource => deleteWorkspaceApi(resourceKey.Name, resourceKey.Parents, cancellationToken),
                 _ => deleteResourceFromApim(resourceKey, ignoreNotFound: true, waitForCompletion: true, cancellationToken)
             });
         };
