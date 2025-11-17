@@ -247,8 +247,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      : ${{ github.workspace }}/downloaded-artifacts
     steps:
       - name: Download artifacts
         id: download-artifacts
