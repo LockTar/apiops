@@ -18,10 +18,10 @@ jobs:
     runs-on: ${{ fromJSON('{"linux-x64":"ubuntu-latest", "linux-arm64":"ubuntu-latest", "linux-musl-x64":"ubuntu-latest", "linux-musl-arm64":"ubuntu-latest", "win-x64":"windows-latest", "osx-arm64":"macos-latest", "osx-x64":"macos-latest"}')[matrix.dotnet-runtime] }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v3
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.x
 
@@ -257,3 +257,38 @@ jobs:
           name: APIOps Toolkit for Azure APIM ${{ github.event.inputs.Release_Version }}
           tag_name: ${{ github.event.inputs.Release_Version }}
           generate_release_notes: true
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.Release_Version }}
+          COMMIT_ID: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Create the release
+          gh release create "$RELEASE_TAG" \
+            --title "APIOps Toolkit for Azure APIM $RELEASE_TAG" \
+            --generate-notes \
+            --draft \
+            --target "$COMMIT_ID"
+
+          # Upload assets
+          gh release upload "$RELEASE_TAG" \
+            "$GITHUB_WORKSPACE/extractor-linux-arm64/extractor-linux-arm64.zip" \
+            "$GITHUB_WORKSPACE/extractor-linux-musl-arm64/extractor-linux-musl-arm64.zip" \
+            "$GITHUB_WORKSPACE/extractor-linux-musl-x64/extractor-linux-musl-x64.zip" \
+            "$GITHUB_WORKSPACE/extractor-linux-x64/extractor-linux-x64.zip" \
+            "$GITHUB_WORKSPACE/extractor-osx-arm64/extractor-osx-arm64.zip" \
+            "$GITHUB_WORKSPACE/extractor-osx-x64/extractor-osx-x64.zip" \
+            "$GITHUB_WORKSPACE/extractor-win-x64/extractor-win-x64.zip" \
+            "$GITHUB_WORKSPACE/publisher-linux-arm64/publisher-linux-arm64.zip" \
+            "$GITHUB_WORKSPACE/publisher-linux-musl-arm64/publisher-linux-musl-arm64.zip" \
+            "$GITHUB_WORKSPACE/publisher-linux-musl-x64/publisher-linux-musl-x64.zip" \
+            "$GITHUB_WORKSPACE/publisher-linux-x64/publisher-linux-x64.zip" \
+            "$GITHUB_WORKSPACE/publisher-osx-arm64/publisher-osx-arm64.zip" \
+            "$GITHUB_WORKSPACE/publisher-osx-x64/publisher-osx-x64.zip" \
+            "$GITHUB_WORKSPACE/publisher-win-x64/publisher-win-x64.zip" \
+            "$GITHUB_WORKSPACE/github/Github.zip" \
+            "$GITHUB_WORKSPACE/ado/Azure_DevOps.zip" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
