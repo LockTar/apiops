@@ -248,14 +248,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
       - name: Download artifacts
         id: download-artifacts
         uses: actions/download-artifact@v5
         with:
           merge-multiple: true
-
-      - name: Checkout repository
-        uses: actions/checkout@v5
+          path: ${{ runner.temp }}/release-artifacts
 
       - name: Create release
         env:
