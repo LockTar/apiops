@@ -232,6 +232,7 @@ jobs:
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
+        
       - name: Create release
         uses: softprops/action-gh-release@v1
         with:
@@ -257,6 +258,10 @@ jobs:
           name: APIOps Toolkit for Azure APIM ${{ github.event.inputs.Release_Version }}
           tag_name: ${{ github.event.inputs.Release_Version }}
           generate_release_notes: true
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -265,10 +270,18 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Check if this is prerelease
+          VERSION="${RELEASE_TAG#v}"    # strip leading "v" if present
+          PRERELEASE_FLAG=""
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
           # Create the release
           gh release create "$RELEASE_TAG" \
             --title "APIOps Toolkit for Azure APIM $RELEASE_TAG" \
             --generate-notes \
+            $PRERELEASE_FLAG \
             --draft \
             --target "$COMMIT_ID"
 
